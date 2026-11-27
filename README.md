@@ -1,4 +1,4 @@
-# Liner
+# Sidetrack
 
 An endless, full-screen feed of new music picked from the music you already love. One song per screen: scroll for the next, like the ones you love, or turn on Auto and let it play in the background.
 

@@ -1,5 +1,5 @@
 'use strict';
-/* Liner — an endless, full-screen feed of new music picked from the music you already love.
+/* Sidetrack — an endless, full-screen feed of new music picked from the music you already love.
    Catalog and 30-second previews: Deezer public API (JSONP) + its CDN (CORS).
    Taste: artist graph from your imported playlists + a small on-device model that listens
    to each preview (timbre, brightness, energy, tempo) and learns from likes and skips.
@@ -48,7 +48,7 @@ const I = {
 };
 
 /* ================= state ================= */
-const KEY = 'liner:v2';
+const KEY = 'liner:v2'; // storage keys keep the app's original name so existing data carries over
 const defaults = () => ({ crates: [], likes: [], seen: {}, skipA: {}, dial: 0.5, auto: false, ml: { pos: [], neg: [], st: null } });
 const S = (() => {
   let v = null;
@@ -903,7 +903,8 @@ function addCrate(name, rows, src) {
   S.crates.unshift({ id: uid(), name: String(name).slice(0, 80) || 'Imported playlist', src, ts: Date.now(), tracks: rows.slice(0, 5000) });
   save(true); tasteChanged();
   const ar = new Set(rows.map(r => norm(r[1]))).size;
-  toast(`Added ${plural(rows.length, 'song')} from ${plural(ar, 'artist')}. Your feed now digs from them.`);
+  const songs = rows.filter(r => r[0]).length;
+  toast(songs ? `Added ${plural(songs, 'song')} from ${plural(ar, 'artist')}. Your feed now digs from them.` : `Added ${plural(ar, 'artist')}. Your feed now digs from them.`);
   return true;
 }
 function tasteChanged() {
@@ -983,7 +984,7 @@ function renderStart() {
     startEl.classList.remove('over');
     startEl.innerHTML = `<div class="sbox">
       <h1>Endless new music from the music you already love.</h1>
-      <p>Bring a playlist from any app. Liner plays you artists that sit next to yours, one full-screen song at a time, and learns from what you like.</p>
+      <p>Bring a playlist from any app. Sidetrack plays you artists that sit next to yours, one full-screen song at a time, and learns from what you like.</p>
       <div class="choices">
         <button class="choice main" data-open="shots">${I.shot}<b>Screenshots of a playlist</b><small>Works with Spotify, Apple Music, YouTube Music and any other app</small></button>
         <button class="choice" data-open="file">${I.file}<b>A playlist link or file</b><small>Deezer links, Exportify CSV, M3U, pasted lists</small></button>
@@ -1039,7 +1040,7 @@ function renderSheet() {
   $('#sheetBody').innerHTML = `
     <div class="shead"><h2>Library</h2><button class="x" data-x aria-label="Close">${I.x}</button></div>
     <div class="sec">
-      <h3>Add music</h3><p>Your playlists are the starting point. Liner never plays you artists you already have.</p>
+      <h3>Add music</h3><p>Your playlists are the starting point. Sidetrack never plays you artists you already have.</p>
       <div class="imp">
         <div class="opt" data-sec="shots"><b>Screenshots of a playlist</b>
           <small>Scroll through a playlist in any app and take screenshots. The text is read on this device. The first time, the reader downloads once (about 6 MB).</small>
@@ -1071,7 +1072,7 @@ function renderSheet() {
     <div class="sec"><h3>Discovery</h3>
       <div class="dial"><label for="dial">Familiar</label><input type="range" id="dial" min="0" max="1" step=".05" value="${S.dial}"><span>Deep cuts</span></div>
       <p class="stat" style="margin-top:14px">The on-device model has learned the sound of <b>${plural(refs, 'song')}</b> from your playlists, <b>${plural(lk, 'like')}</b> and <b>${plural(ml.neg.length, 'skip')}</b>.</p>
-      <p class="muted small" style="margin:0">A song you leave within 7 seconds counts as a skip.${DATA.bytes ? ` Audio downloaded this session: ${(DATA.bytes / 1048576).toFixed(1)} MB.` : ''}${saveData ? ' Data saver is on, so Liner loads fewer songs ahead.' : ''}</p>
+      <p class="muted small" style="margin:0">A song you leave within 7 seconds counts as a skip.${DATA.bytes ? ` Audio downloaded this session: ${(DATA.bytes / 1048576).toFixed(1)} MB.` : ''}${saveData ? ' Data saver is on, so Sidetrack loads fewer songs ahead.' : ''}</p>
       <div class="row" style="margin-top:10px"><button class="btn sm" id="forget">Reset what it learned</button></div>
     </div>
     <div class="sec"><h3>Liked songs</h3>
@@ -1100,7 +1101,7 @@ function wireSheet() {
     }
     const guides = {
       'deezer-short': `Short Deezer links can't be opened from here. Open the link, copy the full address (it looks like deezer.com/playlist/123…) and paste that.`,
-      spotify: `Spotify only shares playlists with apps you sign in to, so Liner can't read this link. Two ways that work:<ol><li><b>Screenshots</b>: open the playlist on your phone, screenshot it while scrolling, and add the screenshots above.</li><li><b>Exportify</b>: open <a href="https://exportify.app" target="_blank" rel="noopener">exportify.app</a>, sign in with Spotify, click Export next to the playlist, then drop the CSV in Playlist file below.</li></ol>`,
+      spotify: `Spotify only shares playlists with apps you sign in to, so Sidetrack can't read this link. Two ways that work:<ol><li><b>Screenshots</b>: open the playlist on your phone, screenshot it while scrolling, and add the screenshots above.</li><li><b>Exportify</b>: open <a href="https://exportify.app" target="_blank" rel="noopener">exportify.app</a>, sign in with Spotify, click Export next to the playlist, then drop the CSV in Playlist file below.</li></ol>`,
       apple: `Apple Music doesn't let other sites read playlists. Two ways that work:<ol><li><b>Screenshots</b> of the playlist, added above.</li><li>On a computer: open the playlist in Apple Music or iTunes, select all songs, copy, and paste into Paste a list below.</li></ol>`,
       youtube: `YouTube doesn't let other sites read playlists. Take <b>screenshots</b> of the playlist in YouTube Music and add them above.`,
       other: `That service doesn't let other sites read playlists. Take <b>screenshots</b> of the playlist and add them above.`,
@@ -1146,18 +1147,18 @@ function wireSheet() {
   };
   const dl = (name, text, type) => { const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([text], { type })); a.download = name; document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(a.href), 2000); };
   $$('[data-export]', b).forEach(x => x.onclick = () => x.dataset.export === 'csv'
-    ? dl('liner-liked.csv', 'Track name,Artist name,Album\n' + S.likes.map(l => [l.t, l.a, l.al].map(v => `"${String(v).replace(/"/g, '""')}"`).join(',')).join('\n'), 'text/csv')
-    : dl('liner-liked.txt', S.likes.map(l => `${l.a} - ${l.t}`).join('\n'), 'text/plain'));
+    ? dl('sidetrack-liked.csv', 'Track name,Artist name,Album\n' + S.likes.map(l => [l.t, l.a, l.al].map(v => `"${String(v).replace(/"/g, '""')}"`).join(',')).join('\n'), 'text/csv')
+    : dl('sidetrack-liked.txt', S.likes.map(l => `${l.a} - ${l.t}`).join('\n'), 'text/plain'));
   $$('[data-unlike]', b).forEach(x => x.onclick = () => { const id = +x.dataset.unlike; S.likes = S.likes.filter(l => l.id !== id); dropExample('pos', id, 'like'); save(); syncLikes(id); renderSheet(); });
   $$('[data-playlike]', b).forEach(x => x.onclick = () => { const l = S.likes.find(l => l.id === +x.dataset.playlike); if (l) playNow(l); });
-  $('#bk').onclick = () => dl(`liner-backup-${new Date().toISOString().slice(0, 10)}.json`, JSON.stringify(S), 'application/json');
+  $('#bk').onclick = () => dl(`sidetrack-backup-${new Date().toISOString().slice(0, 10)}.json`, JSON.stringify(S), 'application/json');
   $('#rs').onclick = () => $('#rsin').click();
   $('#rsin').onchange = async e => {
     try {
       const d = JSON.parse(await e.target.files[0].text()); if (!Array.isArray(d.crates) || !Array.isArray(d.likes)) throw 0;
       Object.assign(S, defaults(), d, { ml: { ...defaults().ml, ...(d.ml || {}) } }); lrDirty = true;
       save(true); tasteChanged(); renderSheet(); toast('Backup restored.');
-    } catch { toast('That file is not a Liner backup.'); }
+    } catch { toast('That file is not a Sidetrack backup.'); }
   };
 }
 async function runOCR(files) {
