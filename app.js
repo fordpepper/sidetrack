@@ -431,6 +431,15 @@ async function feedSeed(s, gen) {
   return 'ok';
 }
 const isLiked = id => S.likes.some(l => l.id === id);
+function walkSeeds() {
+  const out = [];
+  for (const s of SL) {
+    const a = s.item.artist; if (!a || S.skipA[a.id]) continue;
+    const n = norm(a.name); if (G.used.has(n) || out.some(o => o.n === n)) continue;
+    out.push({ name: a.name, n, id: a.id, w: isLiked(s.item.tr.id) ? 1 : .4, grp: 'walk:' + n });
+  }
+  return out;
+}
 const SPOKEN = /\b(folge|teil|kapitel|chapter|episode|h\u00f6rspiel|h\u00f6rbuch|audiobook|audio book|podcast|t\u00fcr)\b\s*\d*|^\d+\s*[-\u2013.:]\s/i;
 const isSpoken = t => SPOKEN.test(t.t) || SPOKEN.test(t.al || '') || isKids(t.al || '');
 const KIDS = /kinder|\bkids\b|\bdisney\b|children|lullab|wiegenlied|schlaflied|nursery|bibi blocksberg|bibi und tina|benjamin bl\u00fcmchen|schl\u00fcmpfe|spongebob|baby ?shark|h\u00f6rspiel|h\u00f6rbuch/i;
@@ -448,7 +457,9 @@ function digMore(n = 6) {
     if (gen !== G.gen) return 0;
     const known = new Set(tasteMap().keys());
     for (let round = 0; round < 3 && added < n && !offline(); round++) {
-      const avail = seedList().filter(s => !G.used.has(s.n));
+      let avail = seedList().filter(s => !G.used.has(s.n));
+      // once your own artists run low, keep walking outward from songs already shown (and not skipped)
+      if (avail.length < 3) avail = avail.concat(walkSeeds());
       const fresh = [...G.pool.values()].filter(c => !G.shownA.has(c.a.id)).length;
       if (avail.length && (round === 0 || fresh < n * 4)) {
         const r = await Promise.all(wsample(avail, round ? 5 : 3).map(s => feedSeed(s, gen)));
@@ -458,11 +469,13 @@ function digMore(n = 6) {
       // Score: strongest link plus a damped share of the others, so one dense cluster can't take
       // over; at most two picks per batch may hang off the same artist of yours.
       const perVia = new Map();
-      const cand = [...G.pool.values()]
-        .filter(c => !G.shownA.has(c.a.id) && !G.knownIds.has(c.a.id) && !known.has(norm(c.a.name)) && c.a.fans >= minFans())
+      const eligible = [...G.pool.values()].filter(c => !G.shownA.has(c.a.id) && !G.knownIds.has(c.a.id) && !known.has(norm(c.a.name)));
+      const popular = eligible.filter(c => c.a.fans >= minFans());
+      // the popularity floor only applies while it leaves enough to choose from (niche tastes stay playable)
+      const cand = (popular.length >= Math.max(3, n - added) ? popular : eligible)
         .map(c => { const vs = [...c.via.values()], mx = Math.max(...vs), sum = vs.reduce((a, b) => a + b, 0);
           const top = [...c.via.entries()].sort((a, b) => b[1] - a[1])[0][0];
-          return { c, s: (mx + .35 * (sum - mx)) * dialFactor(c.a.fans) * Math.pow(.45, S.skipA[c.a.id] || 0) * Math.pow(.7, G.viaUse.get(top) || 0) * (.8 + Math.random() * .4) }; })
+          return { c, s: (mx + .35 * (sum - mx)) * dialFactor(c.a.fans) * Math.pow(.45, S.skipA[c.a.id] || 0) * Math.pow(.55, G.viaUse.get(top) || 0) * (.8 + Math.random() * .4) }; })
         .sort((x, y) => y.s - x.s)
         .filter(({ c }) => { const top = [...c.via.entries()].sort((a, b) => b[1] - a[1])[0][0]; const k = perVia.get(top) || 0; if (k >= 2) return false; perVia.set(top, k + 1); return true; })
         .slice(0, n - added);
@@ -541,7 +554,7 @@ function choose() {
     let nov = .5;
     if (c.feat && recentZ.length) { const z = zs(c.feat); nov = (1 - Math.max(...recentZ.map(r => cos(z, r)))) / 2; }
     let s = (1 - wa - wn) * (c.g / gmax) + wa * (as ?? .5) + wn * nov;
-    if (c.via) s *= Math.pow(.55, viaCount.get(c.via[0]) || 0);
+    if (c.via) s *= Math.pow(.4, viaCount.get(c.via[0]) || 0);
     if (explore) s = Math.random();
     if (s > bs) { bs = s; best = c; }
   }
@@ -1095,6 +1108,13 @@ function addCrate(name, rows, src) {
 }
 function tasteChanged() {
   resetGraph(); flushReady(); emptyFills = 0;
+  // songs queued from the old taste give way to the new one (the next song stays if already playing along)
+  const keepTo = started ? cur + 1 : -1;
+  for (let i = SL.length - 1; i > keepTo; i--) {
+    const s = SL[i]; io.unobserve(s.el); s.el.remove(); unrealize(s.item); SL.splice(i, 1); delete S.seen[s.item.tr.id];
+    if (cur > i) cur--;
+  }
+  if (!started) { cur = SL.length; placeViz(null); feed.scrollTo({ top: 0, behavior: 'instant' }); }
   G.shownA = new Set(SL.map(s => s.item.artist && s.item.artist.id).filter(Boolean));
   ensureAhead(); renderStart();
 }
