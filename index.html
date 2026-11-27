@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Liner — find your next favorite artist</title>
+<meta name="description" content="Import your playlists, dig through artists that sit next to the ones you love, and share finds with friends.">
+<meta name="theme-color" content="#DCE3E8">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wdth,wght@12..96,75..100,300..800&display=swap" rel="stylesheet">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='15' fill='%23161A2E'/%3E%3Ccircle cx='16' cy='16' r='5' fill='%23F2B43A'/%3E%3Ccircle cx='16' cy='16' r='1.4' fill='%23161A2E'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="app">
+  <aside class="nav" aria-label="Main">
+    <a class="logo" href="#/home" aria-label="Liner home"><span class="disc" aria-hidden="true"></span>Liner</a>
+    <nav class="navlinks">
+      <a href="#/home" data-nav="home"><svg viewBox="0 0 24 24"><path d="M3 11.5 12 4l9 7.5V20a1 1 0 0 1-1 1h-5v-6H9v6H4a1 1 0 0 1-1-1z"/></svg><span>Home</span></a>
+      <a href="#/explore" data-nav="explore"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="m15.5 8.5-2 5-5 2 2-5z"/></svg><span>Explore</span></a>
+      <a href="#/library" data-nav="library"><svg viewBox="0 0 24 24"><path d="M3 8h18v12H3zM5 8V5h14v3M8 12h8"/></svg><span>Library</span></a>
+      <a href="#/people" data-nav="people"><svg viewBox="0 0 24 24"><circle cx="9" cy="8" r="3.5"/><path d="M2.5 20c.6-3.6 3.2-5.5 6.5-5.5s5.9 1.9 6.5 5.5"/><circle cx="17" cy="9" r="2.5"/><path d="M17 14.5c2.4 0 4 1.5 4.5 4.5"/></svg><span>People</span></a>
+      <a href="#/me" data-nav="me"><svg viewBox="0 0 24 24"><circle cx="12" cy="8" r="4"/><path d="M4 21c.8-4.4 4-6.5 8-6.5s7.2 2.1 8 6.5"/></svg><span>Profile</span></a>
+    </nav>
+    <button class="btn primary wide" data-act="compose">Share a find</button>
+    <a class="mecard" href="#/me" id="mecard"></a>
+  </aside>
+  <main id="view" tabindex="-1"></main>
+  <aside class="rail" id="rail" aria-label="Your taste and people"></aside>
+</div>
+
+<div class="player" id="player" hidden>
+  <img class="pcover" id="pcover" alt="">
+  <div class="pmeta"><b id="ptitle"></b><a id="partist"></a></div>
+  <div class="pctl">
+    <button class="icon big" id="ptoggle" aria-label="Play"></button>
+    <button class="icon" id="pnext" aria-label="Next track"><svg viewBox="0 0 24 24"><path d="M6 5v14l9-7zM17 5h2v14h-2z"/></svg></button>
+    <button class="icon" id="psave" aria-label="Save to finds"></button>
+  </div>
+  <div class="pbar"><i id="pprog"></i></div>
+</div>
+
+<nav class="tabbar" aria-label="Main">
+  <a href="#/home" data-nav="home"><svg viewBox="0 0 24 24"><path d="M3 11.5 12 4l9 7.5V20a1 1 0 0 1-1 1h-5v-6H9v6H4a1 1 0 0 1-1-1z"/></svg>Home</a>
+  <a href="#/explore" data-nav="explore"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="m15.5 8.5-2 5-5 2 2-5z"/></svg>Explore</a>
+  <button data-act="compose" aria-label="Share a find"><svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg></button>
+  <a href="#/library" data-nav="library"><svg viewBox="0 0 24 24"><path d="M3 8h18v12H3zM5 8V5h14v3M8 12h8"/></svg>Library</a>
+  <a href="#/me" data-nav="me"><svg viewBox="0 0 24 24"><circle cx="12" cy="8" r="4"/><path d="M4 21c.8-4.4 4-6.5 8-6.5s7.2 2.1 8 6.5"/></svg>Profile</a>
+</nav>
+
+<dialog id="modal"><div id="modalBody"></div></dialog>
+<div id="toast" role="status" aria-live="polite"></div>
+<script src="app.js"></script>
+</body>
+</html>
