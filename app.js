@@ -1,7 +1,10 @@
 'use strict';
-/* Liner: music discovery with a social layer. No servers: catalog and previews come from
-   Deezer's public API (JSONP), everything you make lives in this browser, and people
-   follow each other by opening compressed profile links. */
+/* Liner — an endless, full-screen feed of new music picked from the music you already love.
+   Catalog and 30-second previews: Deezer public API (JSONP) + its CDN (CORS).
+   Taste: artist graph from your imported playlists + a small on-device model that listens
+   to each preview (timbre, brightness, energy, tempo) and learns from likes and skips.
+   Data: candidates are judged from a 160 KB slice of their preview; only songs that become
+   a slide are downloaded in full, and those same bytes are what plays. */
 
 /* ================= utils ================= */
 const $ = (s, r = document) => r.querySelector(s);
@@ -9,52 +12,66 @@ const $$ = (s, r = document) => [...r.querySelectorAll(s)];
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const norm = s => String(s || '').toLowerCase().normalize('NFKD').replace(/[̀-ͯ]/g, '')
   .replace(/^the\s+/, '').replace(/\s*&\s*/g, ' and ').replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
+const stripParen = s => String(s || '').replace(/\s*[([].*?[)\]]\s*/g, ' ').replace(/\s+-\s+.*(remaster|version|edit|mix|live).*$/i, '').trim();
 const uid = () => Math.random().toString(36).slice(2, 10);
 const MD5 = /^[0-9a-f]{32}$/;
 const mdOf = url => { const m = /\/images\/(?:cover|artist)\/([0-9a-f]{32})\//.exec(url || ''); return m ? m[1] : ''; };
-const coverUrl = (md5, s = 250) => MD5.test(md5 || '') ? `https://cdn-images.dzcdn.net/images/cover/${md5}/${s}x${s}-000000-80-0-0.jpg` : '';
-const artUrl = (md5, s = 250) => MD5.test(md5 || '') ? `https://cdn-images.dzcdn.net/images/artist/${md5}/${s}x${s}-000000-80-0-0.jpg` : '';
+const coverUrl = (md5, s) => MD5.test(md5 || '') ? `https://cdn-images.dzcdn.net/images/cover/${md5}/${s}x${s}-000000-80-0-0.jpg` : '';
+const artUrl = (md5, s) => MD5.test(md5 || '') ? `https://cdn-images.dzcdn.net/images/artist/${md5}/${s}x${s}-000000-80-0-0.jpg` : '';
 const fmtN = n => n >= 1e6 ? (n / 1e6).toFixed(n >= 1e7 ? 0 : 1) + 'M' : n >= 1e3 ? Math.round(n / 1e3) + 'k' : String(n | 0);
-const plural = (n, w) => `${n.toLocaleString()} ${w}${n === 1 ? '' : 's'}`;
-function ago(ts) {
-  const s = (Date.now() - ts) / 1000;
-  if (s < 60) return 'now'; if (s < 3600) return Math.floor(s / 60) + 'm'; if (s < 86400) return Math.floor(s / 3600) + 'h';
-  if (s < 604800) return Math.floor(s / 86400) + 'd';
-  return new Date(ts).toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
-}
-function hash(str) { let h = 2166136261; for (const c of String(str)) { h ^= c.charCodeAt(0); h = Math.imul(h, 16777619); } return h >>> 0; }
-function rng(seed) { let a = seed >>> 0; return () => { a = (a + 0x6D2B79F5) >>> 0; let t = a; t = Math.imul(t ^ (t >>> 15), t | 1); t ^= t + Math.imul(t ^ (t >>> 7), t | 61); return ((t ^ (t >>> 14)) >>> 0) / 4294967296; }; }
+const plural = (n, w, p) => `${n.toLocaleString()} ${n === 1 ? w : (p || w + 's')}`;
 const debounce = (fn, ms) => { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; };
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const clamp = (x, a, b) => Math.max(a, Math.min(b, x));
+function dice(a, b) { // bigram similarity, tolerant of OCR slips
+  if (!a || !b) return 0; if (a === b) return 1; if (a.length < 2 || b.length < 2) return 0;
+  const bg = s => { const m = new Map(); for (let i = 0; i < s.length - 1; i++) { const g = s.slice(i, i + 2); m.set(g, (m.get(g) || 0) + 1); } return m; };
+  const A = bg(a), B = bg(b); let n = 0; for (const [g, c] of A) n += Math.min(c, B.get(g) || 0);
+  return 2 * n / (a.length + b.length - 2);
+}
+const titleSim = (a, b) => Math.max(dice(norm(a), norm(b)), dice(norm(stripParen(a)), norm(stripParen(b))));
 let toastT;
-function toast(msg) { const t = $('#toast'); t.textContent = msg; t.classList.add('show'); clearTimeout(toastT); toastT = setTimeout(() => t.classList.remove('show'), 3400); }
+function toast(msg, ms = 3600) { const t = $('#toast'); t.textContent = msg; t.classList.add('show'); clearTimeout(toastT); toastT = setTimeout(() => t.classList.remove('show'), ms); }
+const reduced = matchMedia('(prefers-reduced-motion: reduce)');
+const saveData = !!(navigator.connection && navigator.connection.saveData);
+const SLICE = 163840;          // bytes of a preview used to judge a candidate (about 10 s)
+const READY_TARGET = saveData ? 3 : 5;
+const REFS_PER_CRATE = saveData ? 4 : 8;
+const COVER = saveData ? 250 : 500;
 
 const I = {
   play: '<svg viewBox="0 0 24 24"><path d="M7 4.5v15l12.5-7.5z"/></svg>',
-  pause: '<svg viewBox="0 0 24 24"><path d="M6.5 4.5h4v15h-4zM13.5 4.5h4v15h-4z"/></svg>',
   heart: '<svg viewBox="0 0 24 24"><path d="M12 20.5s-8-4.9-8-11A4.5 4.5 0 0 1 12 6.6a4.5 4.5 0 0 1 8 2.9c0 6.1-8 11-8 11z"/></svg>',
-  post: '<svg viewBox="0 0 24 24"><path d="M4 20l1.2-4.2L16 5a2.1 2.1 0 0 1 3 3L8.2 18.8z"/></svg>',
-  nope: '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="m6 6 12 12"/></svg>',
-  repost: '<svg viewBox="0 0 24 24"><path d="M7 7h11l-3-3M17 17H6l3 3"/></svg>',
   x: '<svg viewBox="0 0 24 24"><path d="m6 6 12 12M18 6 6 18"/></svg>',
-  back: '<svg viewBox="0 0 24 24"><path d="M15 5l-7 7 7 7"/></svg>',
-  ext: '<svg viewBox="0 0 24 24"><path d="M14 4h6v6M20 4l-9 9M18 14v6H4V6h6"/></svg>',
+  shot: '<svg viewBox="0 0 24 24"><rect x="6" y="2.5" width="12" height="19" rx="2.5"/><path d="M9.5 7h5M9.5 10.5h5M9.5 14h3"/></svg>',
+  file: '<svg viewBox="0 0 24 24"><path d="M6 3h8l4 4v14H6zM14 3v4h4M9 13h6M9 17h6"/></svg>',
 };
 
 /* ================= state ================= */
-const KEY = 'liner:v1';
-function defaults() {
-  return {
-    me: { handle: 'digger' + (100 + Math.random() * 900 | 0), bio: '', hue: Math.random() * 360 | 0, since: Date.now(), key: uid() + uid() },
-    crates: [], finds: [], posts: [], nope: {}, seen: {}, following: [], channels: [], dial: 0.5, trail: null,
+const KEY = 'liner:v2';
+const defaults = () => ({ crates: [], likes: [], seen: {}, skipA: {}, dial: 0.5, auto: false, ml: { pos: [], neg: [], st: null } });
+const S = (() => {
+  let v = null;
+  try { v = JSON.parse(localStorage.getItem(KEY) || 'null'); } catch { }
+  if (!v) try { // carry over playlists and saved finds from the first version
+    const o = JSON.parse(localStorage.getItem('liner:v1') || 'null');
+    if (o) v = { crates: o.crates || [], likes: (o.finds || []).map(f => ({ id: f.id, t: f.t, a: f.a, ai: f.ai, al: f.al, c: f.c, ts: f.ts || Date.now() })), dial: o.dial ?? 0.5 };
+  } catch { }
+  const d = defaults(); v = v || {};
+  return { ...d, ...v, ml: { ...d.ml, ...(v.ml || {}) } };
+})();
+let saveT;
+function save(now) {
+  clearTimeout(saveT);
+  const w = () => {
+    try { localStorage.setItem(KEY, JSON.stringify(S)); }
+    catch { pruneCache(true); try { localStorage.setItem(KEY, JSON.stringify(S)); } catch { toast('Browser storage is full. Remove a playlist in Library to free space.'); } }
   };
+  now ? w() : (saveT = setTimeout(w, 400));
 }
-const S = (() => { try { const d = defaults(), v = JSON.parse(localStorage.getItem(KEY) || '{}'); return { ...d, ...v, me: { ...d.me, ...(v.me || {}) } }; } catch { return defaults(); } })();
-function save() {
-  try { localStorage.setItem(KEY, JSON.stringify(S)); }
-  catch { pruneCache(true); try { localStorage.setItem(KEY, JSON.stringify(S)); } catch { toast('Browser storage is full. Remove a crate in Library to free space.'); } }
-}
+addEventListener('pagehide', () => save(true));
 
-/* ================= Deezer API (JSONP + queue + cache) ================= */
+/* ================= Deezer API: JSONP, rate-limited queue, cache ================= */
 const mem = new Map();
 function cget(k) {
   if (mem.has(k)) return mem.get(k);
@@ -67,18 +84,18 @@ function cset(k, d, ttlH) {
   try { localStorage.setItem('lc:' + k, s); } catch { pruneCache(); try { localStorage.setItem('lc:' + k, s); } catch { } }
 }
 function pruneCache(all) {
-  const keys = Object.keys(localStorage).filter(k => k.startsWith('lc:'));
-  keys.forEach((k, i) => {
-    let exp = 0; try { exp = JSON.parse(localStorage.getItem(k)).e; } catch { }
-    if (all || exp < Date.now() || i % 2) localStorage.removeItem(k);
+  Object.keys(localStorage).filter(k => k.startsWith('lc:')).forEach((k, i) => {
+    let e = 0; try { e = JSON.parse(localStorage.getItem(k)).e; } catch { }
+    if (all || e < Date.now() || i % 2) localStorage.removeItem(k);
   });
 }
 const Q = []; let active = 0, lastAt = 0, pumpT = 0;
-function enqueue(fn) { return new Promise((res, rej) => { Q.push({ fn, res, rej }); pump(); }); }
+function enqueue(fn, prio) { return new Promise((res, rej) => { prio ? Q.unshift({ fn, res, rej }) : Q.push({ fn, res, rej }); pump(); }); }
 function pump() {
   while (active < 4 && Q.length) {
-    const wait = lastAt + 125 - Date.now();
-    if (wait > 0) { if (!pumpT) pumpT = setTimeout(() => { pumpT = 0; pump(); }, wait); return; }
+    const wait = lastAt + 120 - Date.now();
+    // background tabs throttle timers hard; with only a few requests in flight, spacing is unnecessary
+    if (wait > 0 && !(document.hidden && active < 2)) { if (!pumpT) pumpT = setTimeout(() => { pumpT = 0; pump(); }, wait); return; }
     lastAt = Date.now(); active++;
     const j = Q.shift();
     j.fn().then(j.res, j.rej).finally(() => { active--; pump(); });
@@ -91,17 +108,24 @@ function jsonp(path, params) {
     const u = new URL('https://api.deezer.com/' + path);
     for (const k in params) u.searchParams.set(k, params[k]);
     u.searchParams.set('output', 'jsonp'); u.searchParams.set('callback', cb);
-    const done = () => { clearTimeout(t); delete window[cb]; s.remove(); };
-    const t = setTimeout(() => { done(); window[cb] = () => { }; rej(new Error('timeout')); }, 12000);
-    window[cb] = d => { done(); d && d.error ? rej(Object.assign(new Error(d.error.message || 'Deezer error'), { code: d.error.code })) : res(d); };
-    s.onerror = () => { done(); rej(new Error('network')); };
+    const t = setTimeout(() => { s.remove(); window[cb] = () => { delete window[cb]; }; rej(new Error('timeout')); }, 12000);
+    window[cb] = d => { clearTimeout(t); s.remove(); delete window[cb]; d && d.error ? rej(Object.assign(new Error(d.error.message || 'Deezer error'), { code: d.error.code })) : res(d); };
+    s.onerror = () => { clearTimeout(t); s.remove(); delete window[cb]; rej(new Error('network')); };
     s.src = u; document.head.appendChild(s);
   });
 }
-async function dz(path, params = {}) {
+// consecutive network failures; a run of them means we're offline, not out of music
+const NET = { fails: 0 };
+const netOK = () => { NET.fails = 0; }, netFail = () => { NET.fails++; };
+const offline = () => NET.fails >= 5 || navigator.onLine === false;
+async function dz(path, params = {}, prio) {
   for (let i = 0; ; i++) {
-    try { return await enqueue(() => jsonp(path, params)); }
-    catch (e) { if (i < 3 && (e.code === 4 || e.message === 'timeout')) { await new Promise(r => setTimeout(r, 1200 * (i + 1))); continue; } throw e; }
+    try { const d = await enqueue(() => jsonp(path, params), prio); netOK(); return d; }
+    catch (e) {
+      if (e.code === undefined) netFail(); else netOK(); // a Deezer error reply still means we're online
+      if (i < 3 && (e.code === 4 || (e.message === 'timeout' && !offline()))) { await sleep(1000 * (i + 1)); continue; }
+      throw e;
+    }
   }
 }
 async function dzc(path, params, ttl, map) {
@@ -109,281 +133,677 @@ async function dzc(path, params, ttl, map) {
   const hit = cget(k); if (hit !== undefined) return hit;
   const v = map(await dz(path, params)); cset(k, v, ttl); return v;
 }
-const mapTrack = t => ({ id: t.id, t: t.title_short || t.title || '', a: t.artist?.name || '', ai: t.artist?.id || 0, al: t.album?.title || '', c: t.album?.md5_image || t.md5_image || mdOf(t.album?.cover_medium), d: t.duration || 0 });
+const mapTrack = t => ({ id: t.id, t: t.title_short || t.title || '', a: t.artist?.name || '', ai: t.artist?.id || 0, al: t.album?.title || '', c: t.album?.md5_image || t.md5_image || mdOf(t.album?.cover_medium) });
 const mapArtist = a => ({ id: a.id, name: a.name, fans: a.nb_fan || 0, p: a.md5_image || mdOf(a.picture_medium) });
 const api = {
   searchArtist: q => dzc('search/artist', { q, limit: 6 }, 168, d => (d.data || []).map(mapArtist)),
-  searchTrack: q => dzc('search/track', { q, limit: 20 }, 24, d => (d.data || []).map(mapTrack)),
+  searchTrack: (q, limit = 5) => dzc('search/track', { q, limit }, 168, d => (d.data || []).map(mapTrack)),
   related: id => dzc(`artist/${id}/related`, { limit: 30 }, 168, d => (d.data || []).map(mapArtist)),
   top: id => dzc(`artist/${id}/top`, { limit: 10 }, 72, d => (d.data || []).map(mapTrack)),
-  artist: id => dzc(`artist/${id}`, {}, 168, mapArtist),
-  chart: () => dzc('chart/0/tracks', { limit: 30 }, 6, d => (d.data || []).map(mapTrack)),
-  genres: () => dzc('genre', {}, 168, d => (d.data || []).filter(g => g.id).map(g => ({ id: g.id, name: g.name, pic: g.picture_medium }))),
-  genreArtists: id => dzc(`genre/${id}/artists`, {}, 48, d => (d.data || []).map(mapArtist)),
-  track: id => dz(`track/${id}`),
+  track: id => dz(`track/${id}`, {}, true), // never cached: preview links expire
 };
 async function resolveArtist(name) {
   const r = await api.searchArtist(name); if (!r.length) return null;
   const n = norm(name);
-  return r.find(a => norm(a.name) === n) || r.find(a => { const m = norm(a.name); return m && (m.startsWith(n) || n.startsWith(m)); }) || null;
+  return r.find(a => norm(a.name) === n) || r.find(a => { const m = norm(a.name); return m && n && (m.startsWith(n) || n.startsWith(m)); }) || null;
 }
 
-/* ================= registry for delegated events ================= */
-const TR = new Map(); const reg = t => (TR.set(t.id, t), t.id);
-const CTX = {}; // name -> () => [tracks], drives "next" in the player
+/* ================= audio analysis (Web Worker) ================= */
+const WORKER_SRC = `
+const N=1024,H=512,B=40,NM=26;
+let sr0=0,win,rev,cs,sn,mel,dct,edges;
+function init(sr){
+  if(sr===sr0)return; sr0=sr;
+  win=new Float32Array(N);for(let i=0;i<N;i++)win[i]=.5-.5*Math.cos(2*Math.PI*i/N);
+  rev=new Uint32Array(N);const bits=Math.log2(N);for(let i=0;i<N;i++){let r=0;for(let b=0;b<bits;b++)r|=((i>>b)&1)<<(bits-1-b);rev[i]=r}
+  cs=new Float32Array(N/2);sn=new Float32Array(N/2);for(let i=0;i<N/2;i++){cs[i]=Math.cos(2*Math.PI*i/N);sn[i]=-Math.sin(2*Math.PI*i/N)}
+  const h2m=f=>2595*Math.log10(1+f/700),m2h=m=>700*(Math.pow(10,m/2595)-1),lo=h2m(30),hi=h2m(Math.min(11000,sr/2));
+  const p=[];for(let i=0;i<NM+2;i++)p.push(m2h(lo+(hi-lo)*i/(NM+1))*N/sr);
+  mel=[];for(let m=0;m<NM;m++){const a=p[m],c=p[m+1],d=p[m+2],w=new Float32Array(N/2);for(let k=0;k<N/2;k++)w[k]=k<a||k>d?0:k<=c?(k-a)/((c-a)||1):(d-k)/((d-c)||1);mel.push(w)}
+  dct=[];for(let i=0;i<13;i++){const r=new Float32Array(NM);for(let j=0;j<NM;j++)r[j]=Math.cos(Math.PI*i*(j+.5)/NM);dct.push(r)}
+  edges=[];for(let b=0;b<=B;b++){edges.push(Math.max(1,Math.round(40*Math.pow(10000/40,b/B)*N/sr)))}
+  for(let b=1;b<=B;b++)if(edges[b]<=edges[b-1])edges[b]=edges[b-1]+1;
+}
+function fft(re,im){
+  for(let i=0;i<N;i++){const j=rev[i];if(j>i){let t=re[i];re[i]=re[j];re[j]=t;t=im[i];im[i]=im[j];im[j]=t}}
+  for(let size=2;size<=N;size*=2){const half=size/2,step=N/size;
+    for(let i=0;i<N;i+=size)for(let j=0;j<half;j++){const k=j*step,a=i+j,b=a+half,tr=re[b]*cs[k]-im[b]*sn[k],ti=re[b]*sn[k]+im[b]*cs[k];re[b]=re[a]-tr;im[b]=im[a]-ti;re[a]+=tr;im[a]+=ti}}
+}
+onmessage=e=>{const {id,pcm,sr,want}=e.data;try{
+  init(sr);const nF=Math.max(1,Math.floor((pcm.length-N)/H)+1),K=N/2,binHz=sr/N;
+  const re=new Float32Array(N),im=new Float32Array(N),mag=new Float32Array(K),prev=new Float32Array(K);
+  const db=want.spec?new Float32Array(nF*B):null,onset=new Float32Array(nF);
+  const mS=new Float64Array(13),mQ=new Float64Array(13),me=new Float64Array(NM);let nv=0,cS=0,cQ=0,roS=0,flS=0,rS=0,rQ=0,lo=0,md=0,hi=0,dbMax=-1e9;
+  for(let f=0;f<nF;f++){const o=f*H;let e2=0;
+    for(let i=0;i<N;i++){const x=pcm[o+i]||0;e2+=x*x;re[i]=x*win[i];im[i]=0}
+    fft(re,im);let flux=0;
+    for(let k=0;k<K;k++){const m=Math.hypot(re[k],im[k]);mag[k]=m;const lm=Math.log1p(10*m);if(lm>prev[k])flux+=lm-prev[k];prev[k]=lm}
+    onset[f]=flux;
+    if(db){for(let b=0;b<B;b++){let s=0;const a=edges[b],z=Math.min(K,edges[b+1]);for(let k=a;k<z;k++)s+=mag[k];const v=20*Math.log10(s/Math.max(1,z-a)+1e-9);db[f*B+b]=v;if(v>dbMax)dbMax=v}}
+    if(!want.feat)continue;
+    const rms=Math.sqrt(e2/N);if(rms<3e-4)continue;
+    nv++;let pw=0,cen=0,l=0,mi=0,h=0,lgs=0;
+    for(let k=1;k<K;k++){const p=mag[k]*mag[k]+1e-12,fq=k*binHz;pw+=p;cen+=fq*p;lgs+=Math.log(p);if(fq<150)l+=p;else if(fq<2000)mi+=p;else h+=p}
+    let acc=0,ro=0;for(let k=1;k<K;k++){acc+=mag[k]*mag[k];if(acc>=.85*pw){ro=k*binHz;break}}
+    const c=cen/pw/1000;cS+=c;cQ+=c*c;roS+=ro/1000;flS+=Math.exp(lgs/(K-1))/(pw/(K-1));
+    const rd=20*Math.log10(rms);rS+=rd;rQ+=rd*rd;lo+=l/pw;md+=mi/pw;hi+=h/pw;
+    for(let m=0;m<NM;m++){let s=0;const w=mel[m];for(let k=0;k<K;k++)if(w[k])s+=w[k]*mag[k]*mag[k];me[m]=Math.log10(s+1e-10)}
+    for(let i=0;i<13;i++){let s=0;const r=dct[i];for(let j=0;j<NM;j++)s+=r[j]*me[j];mS[i]+=s;mQ[i]+=s*s}
+  }
+  let feat=null;
+  if(want.feat&&nv>=20){
+    const fr=sr/H,mean=x=>x/nv,sd=(s,q)=>Math.sqrt(Math.max(0,q/nv-(s/nv)*(s/nv)));
+    let om=0;for(let f=0;f<nF;f++)om+=onset[f];om/=nF;let osd=0;for(let f=0;f<nF;f++)osd+=(onset[f]-om)**2;osd=Math.sqrt(osd/nF);
+    let peaks=0;for(let f=1;f<nF-1;f++)if(onset[f]>onset[f-1]&&onset[f]>=onset[f+1]&&onset[f]>om+.5*osd)peaks++;
+    const env=new Float32Array(nF);for(let f=0;f<nF;f++){let s=0,c=0;for(let j=Math.max(0,f-8);j<=Math.min(nF-1,f+8);j++){s+=onset[j];c++}env[f]=Math.max(0,onset[f]-s/c)}
+    let a0=0;for(let f=0;f<nF;f++)a0+=env[f]*env[f];let best=0,bl=0,bs=-1;
+    const lmin=Math.max(2,Math.round(60*fr/190)),lmax=Math.round(60*fr/60);
+    for(let l=lmin;l<=lmax&&l<nF;l++){let s=0;for(let f=0;f+l<nF;f++)s+=env[f]*env[f+l];const bpm=60*fr/l,w=Math.exp(-.5*Math.pow(Math.log2(bpm/120),2));if(s*w>bs){bs=s*w;bl=l;best=s}}
+    const bpm=bl?60*fr/bl:120,clar=a0>0?best/a0:0;
+    feat=[];for(let i=0;i<13;i++)feat.push(mS[i]/nv);for(let i=0;i<13;i++)feat.push(sd(mS[i],mQ[i]));
+    feat.push(mean(cS),sd(cS,cQ),mean(roS),mean(flS),mean(rS),sd(rS,rQ),mean(lo),mean(md),mean(hi),peaks/(nF/fr),bpm/100,clar);
+    feat=feat.map(v=>Number.isFinite(v)?Math.round(v*1e4)/1e4:0);
+  }
+  let spec=null;
+  if(db){spec=new Uint8Array(nF*B);const floor=dbMax-48;for(let i=0;i<db.length;i++)spec[i]=Math.max(0,Math.min(255,(db[i]-floor)/48*255))}
+  postMessage({id,feat,spec,fr:sr/H,frames:nF,bands:B},spec?[spec.buffer]:[]);
+}catch(err){postMessage({id,err:String(err&&err.message||err)})}};
+`;
+const DIM = 38;
+let W = null, wid = 0; const WP = new Map();
+function analyzePCM(pcm, sr, want) {
+  if (!W) {
+    W = new Worker(URL.createObjectURL(new Blob([WORKER_SRC], { type: 'text/javascript' })));
+    W.onmessage = e => { const p = WP.get(e.data.id); if (!p) return; WP.delete(e.data.id); e.data.err ? p.rej(new Error(e.data.err)) : p.res(e.data); };
+    W.onerror = e => { for (const p of WP.values()) p.rej(new Error('analysis failed')); WP.clear(); W = null; e.preventDefault(); };
+  }
+  return new Promise((res, rej) => { const id = ++wid; WP.set(id, { res, rej }); W.postMessage({ id, pcm, sr, want }, [pcm.buffer]); });
+}
+const OAC = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+async function decode(bytes) { // decodeAudioData detaches its input, so it gets a copy
+  const ctx = new OAC(1, 22050, 22050);
+  const buf = await ctx.decodeAudioData(bytes.slice().buffer);
+  const n = buf.length, ch = buf.numberOfChannels, out = new Float32Array(n);
+  for (let c = 0; c < ch; c++) { const d = buf.getChannelData(c); for (let i = 0; i < n; i++) out[i] += d[i] / ch; }
+  return { pcm: out, sr: buf.sampleRate };
+}
+const DATA = { bytes: 0 }; // audio downloaded this session, shown in Library
+async function fetchBytes(url, range) {
+  let r;
+  try { r = await fetch(url, range ? { headers: { Range: range } } : undefined); netOK(); } catch (e) { netFail(); throw e; }
+  if (!r.ok) throw Object.assign(new Error('http ' + r.status), { status: r.status });
+  const total = +((r.headers.get('content-range') || '').split('/')[1] || 0) || +(r.headers.get('content-length') || 0);
+  const bytes = new Uint8Array(await r.arrayBuffer());
+  DATA.bytes += bytes.length;
+  return { bytes, partial: r.status === 206, total };
+}
+
+/* A probe judges a track from the first slice of its preview. */
+async function probe(tr) {
+  const d = await api.track(tr.id);
+  if (!d.preview) throw new Error('nopreview');
+  const r = await fetchBytes(d.preview, `bytes=0-${SLICE - 1}`);
+  let feat = null;
+  try { const { pcm, sr } = await decode(r.bytes); feat = (await analyzePCM(pcm, sr, { feat: true })).feat; } catch { }
+  return { url: d.preview, head: r.partial ? r.bytes : r.bytes, complete: !r.partial || r.bytes.length >= r.total, feat };
+}
+/* Realize downloads the rest of a chosen track and builds the visualizer spectrum. Memoized. */
+function realize(item) {
+  if (item.au) return Promise.resolve(item.au);
+  if (item.rz) return item.rz;
+  const rz = item.rz = (async () => {
+    if (!item.pr) item.pr = probe(item.tr);
+    const p = await item.pr;
+    let bytes = p.head;
+    if (!p.complete) {
+      let rest = null;
+      try { rest = await fetchBytes(p.url, `bytes=${p.head.length}-`); } catch { }
+      if (rest && rest.partial) { bytes = new Uint8Array(p.head.length + rest.bytes.length); bytes.set(p.head); bytes.set(rest.bytes, p.head.length); }
+      else if (rest) bytes = rest.bytes; // server sent the whole file
+      else { // preview link expired: get a fresh one
+        const d = await api.track(item.tr.id); if (!d.preview) throw new Error('nopreview');
+        bytes = (await fetchBytes(d.preview)).bytes;
+      }
+    }
+    if (!item.feat && p.feat) item.feat = p.feat;
+    let viz = null;
+    try { const { pcm, sr } = await decode(bytes); viz = await analyzePCM(pcm, sr, { spec: true, feat: !item.feat }); } catch { }
+    if (!item.feat && viz && viz.feat) item.feat = viz.feat;
+    const au = { url: URL.createObjectURL(new Blob([bytes], { type: 'audio/mpeg' })), viz };
+    if (item.rz !== rz) { URL.revokeObjectURL(au.url); throw new Error('released'); }
+    item.au = au; item.pr = null; // the slice is no longer needed
+    return au;
+  })();
+  rz.catch(() => { if (item.rz === rz) { item.rz = null; item.pr = null; } });
+  return rz;
+}
+function unrealize(item) { if (item.au) URL.revokeObjectURL(item.au.url); item.au = null; item.rz = null; item.pr = null; }
 
 /* ================= taste model ================= */
+function stAdd(v) { // running mean and variance over every analyzed track (Welford)
+  if (!v) return; let st = S.ml.st;
+  if (!st || st.m.length !== DIM) st = S.ml.st = { n: 0, m: Array(DIM).fill(0), q: Array(DIM).fill(0) };
+  if (st.n >= 4000) return; st.n++;
+  for (let i = 0; i < DIM; i++) { const d = v[i] - st.m[i]; st.m[i] += d / st.n; st.q[i] += d * (v[i] - st.m[i]); }
+  lrDirty = true;
+}
+function zs(v) {
+  const st = S.ml.st, out = new Float64Array(DIM);
+  for (let i = 0; i < DIM; i++) { const sd = st && st.n > 2 ? Math.sqrt(st.q[i] / (st.n - 1)) : 1; out[i] = clamp((v[i] - (st ? st.m[i] : 0)) / (sd || 1), -4, 4); }
+  return out;
+}
+function cos(a, b) { let d = 0, x = 0, y = 0; for (let i = 0; i < DIM; i++) { d += a[i] * b[i]; x += a[i] * a[i]; y += b[i] * b[i]; } return x && y ? d / Math.sqrt(x * y) : 0; }
+let LR = null, lrDirty = true, ZP = null, ZN = null;
+function trainLR() { // small logistic regression, retrained whenever examples change
+  lrDirty = false; LR = null;
+  ZP = S.ml.pos.map(e => [zs(e.v), e.w]); ZN = S.ml.neg.map(e => [zs(e.v), e.w]);
+  if (ZP.length < 5 || ZN.length < 5) return;
+  const X = [...ZP.map(([z, w]) => [z, 1, w]), ...ZN.map(([z, w]) => [z, 0, w])];
+  const sp = ZP.reduce((s, e) => s + e[1], 0), sn = ZN.reduce((s, e) => s + e[1], 0);
+  const w = new Float64Array(DIM); let b = 0;
+  for (let ep = 0; ep < 120; ep++) {
+    const lr = 0.05 / (1 + ep * 0.03);
+    for (const [x, y, sw] of X) {
+      let s = b; for (let i = 0; i < DIM; i++) s += w[i] * x[i];
+      const g = (1 / (1 + Math.exp(-s)) - y) * sw * (y ? (sp + sn) / (2 * sp) : (sp + sn) / (2 * sn));
+      for (let i = 0; i < DIM; i++) w[i] -= lr * (g * x[i] + 0.01 * w[i]);
+      b -= lr * g;
+    }
+  }
+  LR = { w, b };
+}
+function audioScore(feat) {
+  if (!feat || !S.ml.pos.length) return null;
+  if (lrDirty) trainLR();
+  const z = zs(feat);
+  const topk = (list, k) => { const s = list.map(([v, w]) => cos(z, v) * Math.min(1.5, w)).sort((a, b) => b - a).slice(0, k); return s.length ? s.reduce((a, b) => a + b, 0) / s.length : 0; };
+  const knn = clamp((topk(ZP, 5) - 0.6 * topk(ZN, 3) + 1) / 2, 0, 1);
+  if (!LR) return knn;
+  let s = LR.b; for (let i = 0; i < DIM; i++) s += LR.w[i] * z[i];
+  return 0.5 * knn + 0.5 / (1 + Math.exp(-s));
+}
+function addExample(kind, id, v, w, src) {
+  if (!v) return;
+  const L = S.ml[kind], sr = src || kind;
+  const i = L.findIndex(e => e.id === id && e.src === sr); if (i >= 0) L.splice(i, 1);
+  L.push({ id, v, w, src: sr });
+  const cap = kind === 'pos' ? 500 : 400;
+  while (L.length > cap) { const j = L.findIndex(e => e.src === 'done'); L.splice(j >= 0 ? j : 0, 1); }
+  lrDirty = true; save();
+}
+function dropExample(kind, id, src) {
+  const n = S.ml[kind].length;
+  S.ml[kind] = S.ml[kind].filter(e => !(e.id === id && (!src || e.src === src)));
+  if (S.ml[kind].length !== n) { lrDirty = true; save(); }
+}
+
+/* learn the sound of imported playlists from short slices, in the background */
+let learning = false;
+async function learnRefs() {
+  if (learning || !started) return; learning = true;
+  try {
+    for (const c of S.crates) {
+      let have = S.ml.pos.filter(e => e.src === 'ref' && e.crate === c.id).length;
+      if (have >= REFS_PER_CRATE || (c.refTried || 0) >= REFS_PER_CRATE * 3) continue;
+      const counts = new Map(); for (const r of c.tracks) counts.set(norm(r[1]), (counts.get(norm(r[1])) || 0) + 1);
+      const rows = c.tracks.map(r => [r, Math.random()]).sort((a, b) => (counts.get(norm(b[0][1])) - counts.get(norm(a[0][1]))) || a[1] - b[1]).map(x => x[0]);
+      const usedA = new Set(S.ml.pos.filter(e => e.src === 'ref' && e.crate === c.id).map(e => e.an));
+      for (const [t, a] of rows) {
+        if (have >= REFS_PER_CRATE || (c.refTried || 0) >= REFS_PER_CRATE * 3 || !S.crates.includes(c)) break;
+        if (usedA.has(norm(a))) continue; usedA.add(norm(a));
+        while (R.length < 2 && !G.exhausted && !G.err) await sleep(1500); // the feed comes first
+        c.refTried = (c.refTried || 0) + 1;
+        try {
+          let tr = null;
+          if (t) tr = (await api.searchTrack(`artist:"${a}" track:"${t}"`, 3)).find(x => dice(norm(x.a), norm(a)) > .6) || null;
+          if (!tr) { const ar = await resolveArtist(a); if (ar) tr = (await api.top(ar.id))[0] || null; }
+          if (!tr) continue;
+          const p = await probe(tr);
+          if (!p.feat || !S.crates.includes(c)) continue;
+          stAdd(p.feat);
+          S.ml.pos.push({ id: tr.id, v: p.feat, w: 1, src: 'ref', crate: c.id, an: norm(a) }); lrDirty = true; have++;
+        } catch { }
+      }
+      save();
+    }
+  } finally { learning = false; }
+}
+
+/* ================= taste graph & candidates ================= */
 function tasteMap() {
   const m = new Map();
-  const add = (name, w, id) => {
-    const n = norm(name); if (!n) return;
-    const e = m.get(n) || { name, n, w: 0, id: 0 }; e.w += w; if (id) e.id = id; m.set(n, e);
-  };
+  const add = (name, w, id) => { const n = norm(name); if (!n) return; const e = m.get(n) || { name, n, w: 0, id: 0 }; e.w += w; if (id) e.id = id; m.set(n, e); };
   for (const c of S.crates) for (const [, a, x] of c.tracks) { add(a, 1); if (x) for (const o of x) add(o, .4); }
-  for (const f of S.finds) add(f.a, 3, f.ai);
-  for (const p of S.posts) add(p.tr.a, 3, p.tr.ai);
+  for (const l of S.likes) add(l.a, 3, l.ai);
   return m;
 }
-function topArtists(n = 30) { return [...tasteMap().values()].sort((a, b) => b.w - a.w).slice(0, n); }
-function seedList() {
-  const m = tasteMap();
-  const arr = [...m.values()].map(e => ({ ...e, w: Math.log2(1 + e.w) }));
-  const byN = new Map(arr.map(e => [e.n, e]));
-  for (const f of S.following) if (f.blend) for (const [id, name] of f.a.slice(0, 25)) {
-    const n = norm(name); const e = byN.get(n);
-    if (e) e.w += .8; else { const s = { name, n, id, w: 1.2, friend: f.h }; arr.push(s); byN.set(n, s); }
-  }
-  arr.sort((a, b) => b.w - a.w);
-  return arr.slice(0, 90);
-}
-function knownNames() { return new Set(tasteMap().keys()); }
-
-/* ================= discovery engine ================= */
-const D = { pool: new Map(), used: new Set(), shownA: new Set(), knownIds: new Set(), cards: [], busy: null, exhausted: false };
-function resetDiscovery(keepPool) {
-  if (!keepPool) { D.pool.clear(); D.used.clear(); }
-  D.shownA.clear(); D.cards = []; D.exhausted = false;
-}
+const hasTaste = () => S.crates.some(c => c.tracks.length) || S.likes.length > 0;
+function seedList() { return [...tasteMap().values()].map(e => ({ ...e, w: Math.log2(1 + e.w) })).sort((a, b) => b.w - a.w).slice(0, 90); }
+const G = { gen: 0, pool: new Map(), used: new Set(), knownIds: new Set(), shownA: new Set(), cands: [], busy: null, exhausted: false, err: false };
+function resetGraph() { G.gen++; G.pool.clear(); G.used.clear(); G.cands = []; G.exhausted = false; G.err = false; G.busy = null; }
 function dialFactor(fans) {
-  const pop = Math.min(1, Math.max(0, (Math.log10(fans + 1) - 3) / 3.6)); // 1k fans -> 0, 4M -> 1
-  const d = S.dial;
+  const pop = clamp((Math.log10(fans + 1) - 3) / 3.6, 0, 1), d = S.dial; // 1k fans -> 0, 4M -> 1
   return d < .5 ? 1 + (.5 - d) * 2.4 * (pop - .4) : 1 + (d - .5) * 2.8 * (.6 - pop);
 }
-function wsample(items, k) {
-  return items.map(it => ({ it, key: Math.pow(Math.random(), 1 / Math.max(.01, it.w)) })).sort((a, b) => b.key - a.key).slice(0, k).map(x => x.it);
-}
-async function feedSeed(s) {
-  D.used.add(s.n);
+function wsample(items, k) { return items.map(it => ({ it, key: Math.pow(Math.random(), 1 / Math.max(.01, it.w)) })).sort((a, b) => b.key - a.key).slice(0, k).map(x => x.it); }
+async function feedSeed(s, gen) {
+  G.used.add(s.n);
   let id = s.id;
-  if (!id) { const a = await resolveArtist(s.name).catch(() => null); if (!a) return; id = s.id = a.id; }
-  D.knownIds.add(id);
-  const rel = await api.related(id).catch(() => []);
+  if (!id) { let a; try { a = await resolveArtist(s.name); } catch { G.used.delete(s.n); return 'err'; } if (!a) return 'none'; id = s.id = a.id; }
+  G.knownIds.add(id);
+  let rel; try { rel = await api.related(id); } catch { G.used.delete(s.n); return 'err'; }
+  if (gen !== G.gen) return 'stale';
   rel.forEach((r, i) => {
-    const c = D.pool.get(r.id) || { a: r, score: 0, via: new Map() };
-    const add = s.w * (1 - i / 36);
-    c.score += add; c.via.set(s.name, (c.via.get(s.name) || 0) + add);
-    D.pool.set(r.id, c);
+    const c = G.pool.get(r.id) || { a: r, score: 0, via: new Map() };
+    const add = s.w * (1 - i / 36); c.score += add; c.via.set(s.name, (c.via.get(s.name) || 0) + add);
+    G.pool.set(r.id, c);
   });
-  return rel;
+  return 'ok';
 }
+const isLiked = id => S.likes.some(l => l.id === id);
 function digMore(n = 6) {
-  if (D.busy) return D.busy;
-  D.busy = (async () => {
-    const out = [];
-    try {
-      if (S.trail && !D.used.has(norm(S.trail.name))) {
-        const ts = { name: S.trail.name, n: norm(S.trail.name), id: S.trail.id, w: 6 };
-        const rel = await feedSeed(ts) || [];
-        // walk one step further from the trail head so the trail has some reach
-        await Promise.all(rel.slice(0, 5).map(r => feedSeed({ name: r.name, n: norm(r.name), id: r.id, w: 2 })));
+  if (G.busy) return G.busy;
+  const gen = G.gen;
+  const run = (async () => {
+    let added = 0, errs = 0, oks = 0;
+    const known = new Set(tasteMap().keys());
+    for (let round = 0; round < 3 && added < n && !offline(); round++) {
+      const avail = seedList().filter(s => !G.used.has(s.n));
+      const fresh = [...G.pool.values()].filter(c => !G.shownA.has(c.a.id)).length;
+      if (avail.length && (fresh < n * 3 || round > 0)) {
+        const r = await Promise.all(wsample(avail, round ? 6 : 5).map(s => feedSeed(s, gen)));
+        errs += r.filter(x => x === 'err').length; oks += r.filter(x => x === 'ok').length;
       }
-      const known = knownNames();
-      for (let round = 0; round < 3 && out.length < n; round++) {
-        const avail = seedList().filter(s => !D.used.has(s.n));
-        const fresh = [...D.pool.values()].filter(c => !D.shownA.has(c.a.id)).length;
-        if (avail.length && (fresh < n * 3 || round > 0)) await Promise.all(wsample(avail, round ? 6 : 5).map(feedSeed));
-        const cand = [...D.pool.values()]
-          .filter(c => !D.shownA.has(c.a.id) && !S.nope[c.a.id] && !D.knownIds.has(c.a.id) && !known.has(norm(c.a.name)))
-          .map(c => ({ c, s: c.score * Math.max(.05, dialFactor(c.a.fans)) * (.8 + Math.random() * .4) }))
-          .sort((x, y) => y.s - x.s).slice(0, n - out.length);
-        if (!cand.length && !avail.length) { D.exhausted = true; break; }
-        const got = await Promise.all(cand.map(async ({ c, s }) => {
-          D.shownA.add(c.a.id);
-          const tops = (await api.top(c.a.id).catch(() => [])).filter(t => t.ai === c.a.id);
-          const pick = tops.slice(0, 6).filter(t => !S.seen[t.id]);
-          const t = pick.length ? pick[Math.random() * Math.min(3, pick.length) | 0] : tops[0];
-          if (!t) return null;
-          S.seen[t.id] = Date.now();
-          const via = [...c.via.entries()].sort((a, b) => b[1] - a[1]).map(v => v[0]);
-          return { tr: t, artist: c.a, via, s };
-        }));
-        out.push(...got.filter(Boolean));
-      }
-      const seenIds = Object.keys(S.seen);
-      if (seenIds.length > 4000) seenIds.sort((a, b) => S.seen[a] - S.seen[b]).slice(0, 1000).forEach(k => delete S.seen[k]);
-      save();
-    } finally { D.busy = null; }
-    D.cards.push(...out);
-    return out;
+      if (gen !== G.gen) return 0;
+      const cand = [...G.pool.values()]
+        .filter(c => !G.shownA.has(c.a.id) && !G.knownIds.has(c.a.id) && !known.has(norm(c.a.name)))
+        .map(c => ({ c, s: c.score * Math.max(.05, dialFactor(c.a.fans)) * Math.pow(.45, S.skipA[c.a.id] || 0) * (.85 + Math.random() * .3) }))
+        .sort((x, y) => y.s - x.s).slice(0, n - added);
+      if (!cand.length && !avail.length) { G.exhausted = true; break; }
+      const got = await Promise.all(cand.map(async ({ c, s }) => {
+        G.shownA.add(c.a.id);
+        let tops; try { tops = await api.top(c.a.id); } catch { errs++; G.shownA.delete(c.a.id); return null; }
+        oks++;
+        const pick = tops.filter(t => t.ai === c.a.id && !S.seen[t.id] && !isLiked(t.id)).slice(0, 6);
+        const t = pick[Math.random() * Math.min(3, pick.length) | 0];
+        return t ? { tr: t, artist: c.a, via: [...c.via.entries()].sort((a, b) => b[1] - a[1]).map(v => v[0]), g: s } : null;
+      }));
+      if (gen !== G.gen) return 0;
+      for (const x of got) if (x) { G.cands.push(x); added++; }
+    }
+    if (gen === G.gen && added === 0 && (offline() || (errs > 0 && oks === 0))) G.err = true;
+    return added;
   })();
-  return D.busy;
+  G.busy = run.finally(() => { if (G.gen === gen) G.busy = null; });
+  return G.busy;
 }
 
-/* ================= player ================= */
-const P = { audio: new Audio(), cur: null, ctx: null, loading: 0 };
-P.audio.preload = 'auto';
-async function play(id, ctx) {
-  const tr = TR.get(id); if (!tr) return;
-  if (P.cur && P.cur.id === id) { P.audio.paused ? P.audio.play().catch(() => { }) : P.audio.pause(); return; }
-  P.cur = tr; if (ctx) P.ctx = ctx;
-  const my = ++P.loading;
-  P.audio.pause(); syncPlayer();
+/* ready buffer: probed candidates waiting for a slide */
+const R = []; let filling = null, fillGen = -1, retryT = 0, emptyFills = 0;
+const readyTarget = () => started ? READY_TARGET : 1; // before the first tap, fetch as little as possible
+function fill() {
+  if (filling && fillGen === G.gen) return filling;
+  const gen = fillGen = G.gen;
+  const run = (async () => {
+    let fails = 0, got = 0;
+    while (R.length < readyTarget() && gen === G.gen) {
+      if (offline()) { G.err = true; break; }
+      if (!G.cands.length) {
+        if (G.exhausted || G.err) break;
+        await digMore(); if (gen !== G.gen) return;
+        if (!G.cands.length) break;
+      }
+      const batch = G.cands.splice(0, Math.min(2, readyTarget() - R.length));
+      const res = await Promise.all(batch.map(async c => {
+        try { c.pr = probe(c.tr); const p = await c.pr; c.feat = p.feat; stAdd(p.feat); return c; }
+        catch { c.pr = null; return null; }
+      }));
+      if (gen !== G.gen) { res.forEach(c => c && unrealize(c)); return; }
+      for (const c of res) if (c) { R.push(c); fails = 0; got++; } else fails++;
+      if (fails >= 8) { G.err = true; break; }
+      ensureAhead(true);
+    }
+    if (!G.err) {
+      emptyFills = got ? 0 : emptyFills + 1;
+      if (emptyFills >= 6 && !G.cands.length) G.exhausted = true; // never spin without progress
+    }
+  })();
+  filling = run.finally(() => {
+    if (fillGen === gen) filling = null;
+    ensureAhead(); updateLoader();
+    if (G.err && !retryT) retryT = setTimeout(() => { retryT = 0; if (G.err) retryNow(); }, 15000);
+  });
+  updateLoader();
+  return filling;
+}
+function choose() {
+  if (!R.length) return null;
+  const gmax = Math.max(...R.map(c => c.g)) || 1;
+  const nEx = S.ml.pos.length + S.ml.neg.length;
+  const wa = S.ml.pos.length ? Math.min(.55, .15 + nEx / 80) : 0;
+  const explore = Math.random() < .12; // keep some surprise so the feed doesn't narrow too fast
+  let best = null, bs = -Infinity;
+  for (const c of R) {
+    const as = audioScore(c.feat);
+    const s = explore ? Math.random() : (1 - wa) * (c.g / gmax) + wa * (as ?? .5);
+    if (s > bs) { bs = s; best = c; }
+  }
+  R.splice(R.indexOf(best), 1);
+  return best;
+}
+function flushReady() { R.splice(0).forEach(unrealize); }
+
+/* ================= slides ================= */
+const feed = $('#feed'), loaderEl = $('#loader');
+const SL = []; let cur = -1, started = false;
+function slideHTML(item) {
+  const t = item.tr, q = encodeURIComponent(`${t.a} ${t.t}`);
+  const via = (item.via || []).slice(0, 2), more = (item.via || []).length - via.length;
+  const liked = isLiked(t.id);
+  return `<img class="bg" src="${coverUrl(t.c, 56)}" alt="" crossorigin="anonymous" decoding="async">
+    <div class="shade"></div>
+    <div class="stage" aria-label="Tap to pause or play, double tap to like">
+      <img class="cover" src="${coverUrl(t.c, COVER)}" alt="Cover of ${esc(t.al)}" crossorigin="anonymous" decoding="async">
+      <span class="paused" aria-hidden="true">${I.play}</span>
+    </div>
+    <div class="meta">
+      <h2>${esc(t.t)}</h2>
+      <p class="artist">${esc(t.a)}</p>
+      ${via.length ? `<p class="why">Near <b>${via.map(esc).join('</b> and <b>')}</b>${more > 0 ? ` and ${more} more of yours` : ''}</p>` : item.label ? `<p class="why">${esc(item.label)}</p>` : ''}
+      <div class="acts">
+        <button class="like" aria-pressed="${liked}">${I.heart}<span>${liked ? 'Liked' : 'Like'}</span></button>
+        <button class="full" aria-expanded="false">Full song</button>
+      </div>
+      <div class="outs" hidden>
+        <a href="https://open.spotify.com/search/${q}" target="_blank" rel="noopener">Spotify</a>
+        <a href="https://music.apple.com/search?term=${q}" target="_blank" rel="noopener">Apple Music</a>
+        <a href="https://music.youtube.com/search?q=${q}" target="_blank" rel="noopener">YouTube Music</a>
+        <a href="https://www.deezer.com/track/${t.id}" target="_blank" rel="noopener">Deezer</a>
+      </div>
+    </div>
+    <div class="prog"><i></i></div>`;
+}
+function makeSlide(item, at = SL.length) {
+  const el = document.createElement('section');
+  el.className = 'slide'; el.setAttribute('aria-roledescription', 'song');
+  el.setAttribute('aria-label', `${item.tr.t} by ${item.tr.a}`);
+  el.innerHTML = slideHTML(item);
+  const s = { item, el, maxT: 0, ended: false, logged: false, col: null };
+  feed.insertBefore(el, SL[at] ? SL[at].el : loaderEl);
+  SL.splice(at, 0, s);
+  if (cur >= at) cur++; // the slide (or loader) on screen moved down one place
+  S.seen[item.tr.id] = Date.now();
+  const ks = Object.keys(S.seen); if (ks.length > 5000) ks.sort((a, b) => S.seen[a] - S.seen[b]).slice(0, 1000).forEach(k => delete S.seen[k]);
+  const img = $('.cover', el);
+  const pal = () => { s.col = palette(img); if (VZ.s === s) VZ.col = s.col; };
+  img.complete && img.naturalWidth ? pal() : img.addEventListener('load', pal, { once: true });
+  io.observe(el);
+  return s;
+}
+function ensureAhead(noFill) {
+  // sitting on the loader: the first ready song takes its place
+  if (cur >= SL.length && R.length) {
+    const s = makeSlide(choose()), i = SL.indexOf(s);
+    activate(i, true); snapTo(i, true);
+    return;
+  }
+  const ahead = started ? 2 : 1;
+  while (R.length && SL.length - 1 - Math.max(cur, 0) < ahead) makeSlide(choose());
+  if (started) { const nx = SL[cur + 1]; if (nx) realize(nx.item).catch(() => { }); } // next song ready to play instantly
+  if (!noFill && hasTaste() && R.length < readyTarget() && (G.cands.length || (!G.exhausted && !G.err))) fill();
+  updateLoader();
+}
+function updateLoader() {
+  const msg = $('#lmsg'), retry = $('#lretry');
+  let t, idle = true; retry.hidden = true;
+  if (!hasTaste()) t = 'Add some music in Library to start your feed.';
+  else if (G.err) { t = "Can't reach Deezer right now. Check your connection."; retry.hidden = false; }
+  else if (G.exhausted && !R.length && !G.cands.length && !filling) t = "That's every artist near your music for now. Add another playlist or like a few more songs to open new paths.";
+  else { t = 'Finding the next song'; idle = false; }
+  msg.textContent = t; loaderEl.classList.toggle('idle', idle);
+}
+function retryNow() { G.err = false; NET.fails = 0; clearTimeout(retryT); retryT = 0; emptyFills = 0; fill(); }
+$('#lretry').onclick = retryNow;
+addEventListener('online', () => { if (G.err) retryNow(); });
+function snapTo(i, instant) {
+  feed.scrollTo({ top: i * feed.clientHeight, behavior: instant || document.hidden || reduced.matches ? 'instant' : 'smooth' });
+}
+const io = new IntersectionObserver(es => {
+  for (const e of es) if (e.isIntersecting) {
+    const i = e.target === loaderEl ? SL.length : SL.findIndex(s => s.el === e.target);
+    if (i >= 0) activate(i);
+  }
+}, { root: feed, threshold: 0.6 });
+io.observe(loaderEl);
+feed.addEventListener('scrollend', () => { const i = Math.round(feed.scrollTop / feed.clientHeight); if (i !== cur && i >= 0 && i <= SL.length) activate(i); });
+
+function leave(s, viaAuto) {
+  if (!s || s.logged || !started) return;
+  const t = s.item.tr, liked = isLiked(t.id);
+  if (!liked && !viaAuto && !s.ended && s.maxT > 0.3 && s.maxT < 7 && s.item.via) {
+    s.logged = true; // a quick skip
+    addExample('neg', t.id, s.item.feat, 1);
+    S.skipA[t.ai] = (S.skipA[t.ai] || 0) + 1;
+  } else if (!liked && s.ended && !S.auto && s.item.via) {
+    s.logged = true; // listened all the way through by choice
+    addExample('pos', t.id, s.item.feat, .3, 'done');
+  }
+}
+function activate(i, viaAuto) {
+  if (i === cur) return;
+  const prev = SL[cur];
+  if (prev) { leave(prev, viaAuto); prev.el.classList.remove('is-paused'); }
+  cur = i;
+  if (i >= SL.length) { P.tok++; P.audio.pause(); P.s = null; placeViz(null); ensureAhead(); return; }
+  const s = SL[i];
+  s.maxT = 0; s.ended = false;
+  placeViz(s);
+  if (started) playSlide(s);
+  ensureAhead();
+  // keep memory and data bounded: release audio far from the current slide
+  SL.forEach((x, j) => { if ((j < i - 2 || j > i + 2) && (x.item.au || x.item.rz)) unrealize(x.item); });
+  if (started && !learning) setTimeout(learnRefs, 4000);
+  save();
+}
+async function playSlide(s) {
+  const my = ++P.tok;
+  P.s = s; setMedia(s);
   try {
-    const d = await api.track(id);
-    if (my !== P.loading) return;
-    if (!d.preview) { toast(`Deezer has no preview for “${tr.t}”. Skipping.`); return next(); }
-    P.audio.src = d.preview;
+    const au = await realize(s.item);
+    if (my !== P.tok) return;
+    if (P.audio.src !== au.url) P.audio.src = au.url;
+    P.audio.currentTime = 0;
     await P.audio.play();
   } catch (e) {
-    if (my === P.loading && e.name !== 'AbortError') toast(e.name === 'NotAllowedError' ? 'Press play again to start audio.' : 'Could not load the preview. Check your connection.');
-  }
-  syncPlayer();
-}
-async function next() {
-  if (!P.cur) return;
-  let list = (CTX[P.ctx] || (() => []))();
-  let i = list.findIndex(t => t.id === P.cur.id);
-  if (P.ctx === 'foryou' && i >= list.length - 2 && !D.exhausted) { await digMore(); list = CTX.foryou(); renderMoreCards(); }
-  const nx = list[i + 1];
-  if (nx) { reg(nx); play(nx.id); } else { P.audio.pause(); syncPlayer(); }
-}
-P.audio.addEventListener('ended', next);
-P.audio.addEventListener('play', syncPlayer);
-P.audio.addEventListener('pause', syncPlayer);
-P.audio.addEventListener('timeupdate', () => { $('#pprog').style.width = (P.audio.currentTime / (P.audio.duration || 30) * 100) + '%'; });
-function isPlaying(id) { return P.cur && P.cur.id === id && !P.audio.paused; }
-function syncPlayer() {
-  const el = $('#player'), tr = P.cur;
-  if (!tr) { el.hidden = true; return; }
-  el.hidden = false;
-  $('#pcover').src = coverUrl(tr.c, 120);
-  $('#ptitle').textContent = tr.t;
-  const pa = $('#partist'); pa.textContent = tr.a; pa.href = '#/artist/' + tr.ai;
-  const on = !P.audio.paused;
-  $('#ptoggle').innerHTML = on ? I.pause : I.play; $('#ptoggle').setAttribute('aria-label', on ? 'Pause' : 'Play');
-  const sv = $('#psave'); sv.innerHTML = I.heart; sv.classList.toggle('on', isFound(tr.id)); sv.setAttribute('aria-label', isFound(tr.id) ? 'Remove from finds' : 'Save to finds');
-  $$('[data-pl]').forEach(b => {
-    const p = isPlaying(+b.dataset.pl);
-    b.closest('.sleeve,.trk')?.classList.toggle('playing', p);
-    if (b.classList.contains('playbtn')) b.innerHTML = (p ? I.pause : I.play) + (p ? 'Pause' : 'Play preview');
-    else if (b.classList.contains('art')) { const s = b.querySelector('span'); if (s) s.innerHTML = p ? I.pause : I.play; }
-  });
-  if ('mediaSession' in navigator) {
-    navigator.mediaSession.metadata = new MediaMetadata({ title: tr.t, artist: tr.a, album: tr.al, artwork: [{ src: coverUrl(tr.c, 500), sizes: '500x500', type: 'image/jpeg' }] });
+    if (my !== P.tok) return;
+    if (e && e.name === 'NotAllowedError') { s.el.classList.add('is-paused'); return; }
+    if (e && (e.name === 'AbortError' || e.message === 'released')) return;
+    toast(e && e.message === 'nopreview' ? 'No preview for this one. Skipping.' : 'This preview did not load. Skipping.');
+    setTimeout(() => { if (P.tok === my) advance(true); }, 900);
   }
 }
-$('#ptoggle').onclick = () => { if (P.cur) P.audio.paused ? P.audio.play().catch(() => { }) : P.audio.pause(); };
-$('#pnext').onclick = next;
-$('#psave').onclick = () => { if (P.cur) toggleFind(P.cur.id); };
+function advance(viaAuto) { const j = Math.min(cur + 1, SL.length); if (j === cur) return; activate(j, viaAuto); snapTo(j); }
+function back() { if (cur > 0) { const j = cur - 1; activate(j); snapTo(j); } }
+
+/* ================= player ================= */
+const P = { audio: new Audio(), tok: 0, s: null };
+P.audio.preload = 'auto';
+P.audio.addEventListener('timeupdate', () => {
+  const s = P.s; if (!s || !P.audio.src.startsWith('blob:')) return;
+  const t = P.audio.currentTime; if (t > s.maxT) s.maxT = t;
+  const bar = $('.prog i', s.el); if (bar) bar.style.width = (t / (P.audio.duration || 30) * 100) + '%';
+});
+P.audio.addEventListener('ended', () => {
+  const s = P.s; if (!s || !P.audio.src.startsWith('blob:')) return;
+  s.ended = true;
+  if (S.auto) advance(true);
+  else { leave(s, false); P.audio.currentTime = 0; P.audio.play().catch(() => { }); }
+});
+const syncPaused = () => { if (P.s) P.s.el.classList.toggle('is-paused', P.audio.paused && started); };
+P.audio.addEventListener('play', syncPaused);
+P.audio.addEventListener('pause', syncPaused);
+function togglePlay() { if (!P.s) return; P.audio.paused ? P.audio.play().catch(() => { }) : P.audio.pause(); }
+function setMedia(s) {
+  if (!('mediaSession' in navigator)) return;
+  const t = s.item.tr;
+  try { navigator.mediaSession.metadata = new MediaMetadata({ title: t.t, artist: t.a, album: t.al, artwork: [{ src: coverUrl(t.c, 500), sizes: '500x500', type: 'image/jpeg' }] }); } catch { }
+}
 if ('mediaSession' in navigator) {
-  navigator.mediaSession.setActionHandler('nexttrack', next);
-  navigator.mediaSession.setActionHandler('play', () => P.audio.play());
-  navigator.mediaSession.setActionHandler('pause', () => P.audio.pause());
+  const h = (a, f) => { try { navigator.mediaSession.setActionHandler(a, f); } catch { } };
+  h('play', () => P.audio.play()); h('pause', () => P.audio.pause());
+  h('nexttrack', () => advance(false)); h('previoustrack', back);
 }
+// a silent clip played inside the first tap unlocks audio for later automatic playback (iOS)
+let SILENT = '';
+function unlockAudio() {
+  if (!SILENT) {
+    const n = 800, b = new Uint8Array(44 + n), v = new DataView(b.buffer), w = (o, s) => [...s].forEach((c, i) => b[o + i] = c.charCodeAt(0));
+    w(0, 'RIFF'); v.setUint32(4, 36 + n, true); w(8, 'WAVEfmt '); v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+    v.setUint32(24, 8000, true); v.setUint32(28, 8000, true); v.setUint16(32, 1, true); v.setUint16(34, 8, true); w(36, 'data'); v.setUint32(40, n, true); b.fill(128, 44);
+    let s = ''; b.forEach(x => s += String.fromCharCode(x)); SILENT = 'data:audio/wav;base64,' + btoa(s);
+  }
+  P.audio.src = SILENT; P.audio.play().catch(() => { });
+}
+
+/* ================= visualizer: record grooves that move with the music ================= */
+const cv = document.createElement('canvas'); cv.className = 'viz'; cv.setAttribute('aria-hidden', 'true');
+const cx = cv.getContext('2d');
+const VZ = { s: null, col: null, lv: new Float32Array(40), w: 0, h: 0, dpr: 1, ox: 0, oy: 0, r0: 0 };
+function placeViz(s) {
+  VZ.s = s; VZ.lv.fill(0);
+  if (!s) { cv.remove(); return; }
+  s.el.insertBefore(cv, $('.stage', s.el));
+  VZ.col = s.col; sizeViz();
+}
+function sizeViz() {
+  const s = VZ.s; if (!s) return;
+  const r = s.el.getBoundingClientRect(), c = $('.stage', s.el).getBoundingClientRect();
+  if (!r.width) return;
+  VZ.dpr = Math.min(devicePixelRatio || 1, matchMedia('(pointer:coarse)').matches ? 1.5 : 2);
+  cv.width = Math.round(r.width * VZ.dpr); cv.height = Math.round(r.height * VZ.dpr);
+  VZ.w = cv.width; VZ.h = cv.height;
+  VZ.ox = (c.left - r.left + c.width / 2) * VZ.dpr; VZ.oy = (c.top - r.top + c.height / 2) * VZ.dpr; VZ.r0 = c.width / 2 * VZ.dpr;
+}
+addEventListener('resize', debounce(() => { if (cur >= 0) feed.scrollTo({ top: cur * feed.clientHeight, behavior: 'instant' }); sizeViz(); }, 120));
+const FALLBACK = [[242, 180, 58], [120, 130, 255]];
+function palette(img) {
+  try {
+    const c = document.createElement('canvas'); c.width = c.height = 24;
+    const g = c.getContext('2d', { willReadFrequently: true }); g.drawImage(img, 0, 0, 24, 24);
+    const d = g.getImageData(0, 0, 24, 24).data, bins = Array.from({ length: 12 }, (_, i) => ({ i, w: 0, r: 0, g: 0, b: 0 }));
+    for (let i = 0; i < d.length; i += 4) {
+      const r = d[i] / 255, gg = d[i + 1] / 255, b = d[i + 2] / 255, mx = Math.max(r, gg, b), mn = Math.min(r, gg, b);
+      if (mx - mn < .04) continue;
+      let h = mx === r ? (gg - b) / (mx - mn) : mx === gg ? 2 + (b - r) / (mx - mn) : 4 + (r - gg) / (mx - mn); h = (h * 60 + 360) % 360;
+      const sat = (mx - mn) / mx, wt = sat * sat * mx, bn = bins[Math.floor(h / 30) % 12]; bn.w += wt; bn.r += r * wt; bn.g += gg * wt; bn.b += b * wt;
+    }
+    const top = bins.filter(b => b.w > 0).sort((a, b) => b.w - a.w);
+    if (!top.length) return FALLBACK;
+    const vivid = b => { const r = b.r / b.w, g2 = b.g / b.w, bl = b.b / b.w, k = .95 / (Math.max(r, g2, bl) || 1); return [r * k * 255, g2 * k * 255, bl * k * 255].map(Math.round); };
+    const second = top.find(b => Math.min(Math.abs(b.i - top[0].i), 12 - Math.abs(b.i - top[0].i)) >= 2 && b.w > top[0].w * .12);
+    return [vivid(top[0]), second ? vivid(second) : FALLBACK[0]];
+  } catch { return FALLBACK; }
+}
+function drawViz(time) {
+  requestAnimationFrame(drawViz);
+  const s = VZ.s; if (!s || document.hidden || !VZ.w) return;
+  const viz = s.item.au && s.item.au.viz, playing = P.s === s && !P.audio.paused && P.audio.src.startsWith('blob:');
+  const B = 40, lv = VZ.lv, still = reduced.matches;
+  if (viz && viz.spec && playing && !still) {
+    const f = Math.min(viz.frames - 1, Math.max(0, Math.floor(P.audio.currentTime * viz.fr)));
+    for (let b = 0; b < B; b++) { const tg = viz.spec[f * viz.bands + b] / 255; lv[b] += (tg - lv[b]) * (tg > lv[b] ? .55 : .12); }
+  } else for (let b = 0; b < B; b++) lv[b] += (.2 - lv[b]) * (still ? 1 : .06);
+  const { w, h, ox, oy, r0, dpr } = VZ;
+  cx.clearRect(0, 0, w, h);
+  const [c1, c2] = VZ.col || FALLBACK;
+  let bass = 0; for (let b = 0; b < 6; b++) bass += lv[b]; bass /= 6;
+  const g = cx.createRadialGradient(ox, oy, r0 * .6, ox, oy, r0 * (1.9 + bass * .5));
+  g.addColorStop(0, `rgba(${c1},${.18 + bass * .35})`); g.addColorStop(1, `rgba(${c1},0)`);
+  cx.fillStyle = g; cx.fillRect(0, 0, w, h);
+  const far = Math.hypot(Math.max(ox, w - ox), Math.max(oy, h - oy)), start = r0 * 1.1, rings = 30, t = still ? 0 : time / 1000;
+  for (let i = 0; i < rings; i++) {
+    const fr = i / (rings - 1), r = start + (far - start) * Math.pow(fr, 1.25);
+    const e = lv[Math.min(B - 1, Math.floor(fr * B))];
+    const amp = e * e * r0 * .2 * (1 - fr * .45) + bass * r0 * .03;
+    const lobes = 3 + (i % 5), ph = t * (.35 + i * .045) * (i % 2 ? 1 : -1);
+    const mix = k => Math.round(c1[k] + (c2[k] - c1[k]) * fr);
+    cx.strokeStyle = `rgba(${mix(0)},${mix(1)},${mix(2)},${.1 + .55 * e * (1 - fr * .5)})`;
+    cx.lineWidth = (.8 + 2.6 * e) * dpr;
+    cx.beginPath();
+    for (let k = 0; k <= 96; k++) {
+      const a = k / 96 * Math.PI * 2, rr = r + amp * Math.sin(lobes * a + ph) * (.6 + .4 * Math.sin(a * 2 - ph * .7));
+      const x = ox + rr * Math.cos(a), y = oy + rr * Math.sin(a);
+      k ? cx.lineTo(x, y) : cx.moveTo(x, y);
+    }
+    cx.stroke();
+  }
+}
+requestAnimationFrame(drawViz);
+
+/* ================= likes ================= */
+function toggleLike(s, forceOn) {
+  const t = s.item.tr, on = isLiked(t.id);
+  if (on && forceOn) return;
+  if (on) { S.likes = S.likes.filter(l => l.id !== t.id); dropExample('pos', t.id, 'like'); }
+  else {
+    S.likes.unshift({ id: t.id, t: t.t, a: t.a, ai: t.ai, al: t.al, c: t.c, ts: Date.now() });
+    addExample('pos', t.id, s.item.feat, 2, 'like'); dropExample('neg', t.id);
+    if (S.skipA[t.ai]) delete S.skipA[t.ai];
+  }
+  save(); syncLikes(t.id);
+}
+function syncLikes(id) {
+  for (const s of SL) if (s.item.tr.id === id) {
+    const on = isLiked(id), b = $('.like', s.el);
+    b.setAttribute('aria-pressed', on); b.querySelector('span').textContent = on ? 'Liked' : 'Like';
+  }
+}
+function burst(s) {
+  if (reduced.matches) return;
+  const b = document.createElement('span'); b.className = 'burst'; b.innerHTML = I.heart;
+  $('.stage', s.el).appendChild(b); setTimeout(() => b.remove(), 750);
+}
+
+/* slide interactions */
+let tapT = 0, tapS = null;
+feed.addEventListener('click', e => {
+  const el = e.target.closest('.slide'); if (!el || el === loaderEl) return;
+  const s = SL.find(x => x.el === el); if (!s) return;
+  if (e.target.closest('.like')) { toggleLike(s); if (isLiked(s.item.tr.id)) burst(s); return; }
+  const full = e.target.closest('.full');
+  if (full) { const o = $('.outs', el); o.hidden = !o.hidden; full.setAttribute('aria-expanded', !o.hidden); return; }
+  if (e.target.closest('.stage')) {
+    if (tapT && tapS === s) { clearTimeout(tapT); tapT = 0; toggleLike(s, true); burst(s); return; }
+    tapS = s; clearTimeout(tapT);
+    tapT = setTimeout(() => { tapT = 0; if (started && SL[cur] === s) togglePlay(); }, 260);
+  }
+});
 document.addEventListener('keydown', e => {
-  if (e.key === ' ' && P.cur && !e.target.closest('input,textarea,button,a,select,[contenteditable]')) { e.preventDefault(); $('#ptoggle').click(); }
+  if (!started || $('#sheet').open || e.metaKey || e.ctrlKey || e.altKey || (e.target.closest && e.target.closest('input,textarea'))) return;
+  const k = e.key;
+  if (k === 'ArrowDown' || k === 'j' || k === 'PageDown') { e.preventDefault(); advance(false); }
+  else if (k === 'ArrowUp' || k === 'k' || k === 'PageUp') { e.preventDefault(); back(); }
+  else if (k === ' ' && !(e.target.closest && e.target.closest('button,a'))) { e.preventDefault(); togglePlay(); }
+  else if ((k === 'l' || k === 'L') && SL[cur]) { toggleLike(SL[cur]); if (isLiked(SL[cur].item.tr.id)) burst(SL[cur]); }
+  else if (k === 'a' || k === 'A') setAuto(!S.auto);
+});
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden && cur >= 0) { feed.scrollTo({ top: cur * feed.clientHeight, behavior: 'instant' }); sizeViz(); }
 });
 
-/* ================= finds & posts ================= */
-const isFound = id => S.finds.some(f => f.id === id);
-function toggleFind(id, via) {
-  const tr = TR.get(id); if (!tr) return;
-  const i = S.finds.findIndex(f => f.id === id);
-  if (i >= 0) { S.finds.splice(i, 1); toast('Removed from your finds.'); }
-  else { S.finds.unshift({ ...tr, ts: Date.now(), via: via || '' }); toast(`Saved “${tr.t}” to your finds.`); }
-  save(); syncHearts(); syncPlayer();
+/* ================= auto mode ================= */
+function setAuto(on) {
+  S.auto = !!on; save();
+  $('#auto').setAttribute('aria-checked', S.auto);
+  toast(S.auto ? 'Auto is on. Songs play one after another, even with the screen off.' : 'Auto is off. Each song repeats until you scroll.');
 }
-function syncHearts() { $$('[data-act=save]').forEach(b => { const on = isFound(+b.dataset.id); b.classList.toggle('on', on); b.setAttribute('aria-label', on ? 'Remove from finds' : 'Save to finds'); }); }
-function addPost(tr, note, rp) {
-  const p = { id: uid(), ts: Date.now(), note: note.slice(0, 280), tr: { id: tr.id, t: tr.t, a: tr.a, ai: tr.ai, al: tr.al, c: tr.c, d: tr.d || 0 } };
-  if (rp) p.rp = rp;
-  S.posts.unshift(p); save();
-  return p;
-}
+$('#auto').onclick = () => setAuto(!S.auto);
+$('#auto').setAttribute('aria-checked', S.auto);
 
-/* ================= profile links ================= */
-const b64u = {
-  enc: u8 => { let s = ''; for (let i = 0; i < u8.length; i += 0x8000) s += String.fromCharCode(...u8.subarray(i, i + 0x8000)); return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, ''); },
-  dec: s => { s = s.replace(/-/g, '+').replace(/_/g, '/'); const b = atob(s + '==='.slice((s.length + 3) % 4)); return Uint8Array.from(b, c => c.charCodeAt(0)); },
-};
-async function streamBytes(bytes, T) { return new Uint8Array(await new Response(new Blob([bytes]).stream().pipeThrough(T)).arrayBuffer()); }
-async function packProfile() {
-  const me = S.me;
-  const data = {
-    v: 1, k: me.key, h: me.handle, b: me.bio, c: me.hue, s: me.since,
-    a: topArtists(30).map(e => [e.id || 0, e.name]),
-    p: S.posts.slice(0, 25).map(p => [p.id, p.ts, p.note, p.tr.id, p.tr.t, p.tr.a, p.tr.ai, p.tr.c, p.tr.al, p.rp ? p.rp.h : '']),
-  };
-  const z = await streamBytes(new TextEncoder().encode(JSON.stringify(data)), new CompressionStream('deflate-raw'));
-  return location.origin + location.pathname + '#/u/' + b64u.enc(z);
-}
-async function unpackProfile(str) {
-  const raw = JSON.parse(new TextDecoder().decode(await streamBytes(b64u.dec(str), new DecompressionStream('deflate-raw'))));
-  const S_ = (v, n) => String(v ?? '').slice(0, n), N_ = v => Number.isFinite(+v) ? +v : 0;
-  if (raw.v !== 1 || !raw.k) throw new Error('bad');
-  return {
-    k: S_(raw.k, 40), h: S_(raw.h, 24).replace(/[^\w.]/g, '') || 'someone', b: S_(raw.b, 200), c: N_(raw.c) % 360, s: N_(raw.s),
-    a: (Array.isArray(raw.a) ? raw.a : []).slice(0, 30).map(x => [N_(x[0]), S_(x[1], 80)]).filter(x => x[1]),
-    p: (Array.isArray(raw.p) ? raw.p : []).slice(0, 25).map(x => ({
-      id: S_(x[0], 20), ts: Math.min(N_(x[1]), Date.now()), note: S_(x[2], 280),
-      tr: { id: N_(x[3]), t: S_(x[4], 200), a: S_(x[5], 120), ai: N_(x[6]), c: MD5.test(x[7]) ? x[7] : '', al: S_(x[8], 200) },
-      rp: x[9] ? { h: S_(x[9], 24) } : null,
-    })).filter(p => p.tr.id),
-    updated: Date.now(),
-  };
-}
-async function copyProfileLink() {
-  try {
-    const url = await packProfile();
-    if (navigator.share && matchMedia('(pointer:coarse)').matches) { await navigator.share({ title: `@${S.me.handle} on Liner`, url }).catch(() => { }); return; }
-    await navigator.clipboard.writeText(url);
-    toast('Profile link copied. Send it to a friend so they can follow you.');
-  } catch { openModal('Your profile link', `<p class="small muted">Copy this link and send it to someone.</p><textarea readonly rows="5" onclick="this.select()">${esc(await packProfile())}</textarea>`); }
-}
-function matchWith(fa) {
-  const mine = new Set(topArtists(60).map(e => e.n));
-  const theirs = fa.map(x => norm(x[1])).filter(Boolean);
-  if (!mine.size || !theirs.length) return { pct: 0, shared: [] };
-  const shared = fa.filter(x => mine.has(norm(x[1]))).map(x => x[1]);
-  const pct = Math.round(Math.min(1, shared.length / Math.sqrt(Math.min(30, mine.size) * theirs.length) * 1.6) * 100);
-  return { pct, shared };
-}
-const followed = k => S.following.find(f => f.k === k);
-let incoming = null; // profile currently being previewed from a link
-
-/* ================= channels (genre desks built from Deezer charts) ================= */
-async function channelPosts(gid) {
-  const g = (await api.genres().catch(() => [])).find(x => x.id === gid); if (!g) return [];
-  const day = new Date().toISOString().slice(0, 10);
-  const k = `chp:${gid}:${day}`; const hit = cget(k); if (hit) return hit;
-  const arts = await api.genreArtists(gid).catch(() => []);
-  const r = rng(hash(k)); const pick = arts.slice().sort(() => r() - .5).slice(0, 4);
-  const start = new Date(day + 'T00:00:00').getTime();
-  const posts = (await Promise.all(pick.map(async (a, i) => {
-    const tops = await api.top(a.id).catch(() => []); const t = tops[Math.floor(r() * Math.min(5, tops.length))];
-    return t && { id: 'c' + gid + t.id, ts: start + 1 + i, note: `${a.name}: ${fmtN(a.fans)} fans on Deezer.`, tr: t, ch: { id: gid, name: g.name } };
-  }))).filter(Boolean);
-  cset(k, posts, 24);
-  return posts;
-}
-
-/* ================= import parsing ================= */
+/* ================= import: parsing ================= */
 const cleanArtist = s => String(s || '').replace(/\s+(feat\.?|ft\.?|featuring|with)\s+.*$/i, '').replace(/\s+/g, ' ').trim();
-const cleanTitle = s => String(s || '').replace(/\.(mp3|flac|m4a|ogg|wav|opus|aac)$/i, '').replace(/^\s*\d{1,3}[\s.\-_)]+/, '').trim();
-function splitArtists(s) {
-  s = String(s || ''); const parts = (s.includes(';') ? s.split(';') : s.split(/,\s*/)).map(cleanArtist).filter(Boolean);
-  return parts.length ? parts : [];
-}
+const cleanTitle = s => String(s || '').replace(/\.(mp3|flac|m4a|ogg|wav|opus|aac)$/i, '').replace(/^\s*\d{1,3}[\s.\-_)]+(?=\D)/, '').trim();
+function splitArtists(s) { s = String(s || ''); return (s.includes(';') ? s.split(';') : s.split(/,\s*/)).map(cleanArtist).filter(Boolean); }
 function trackRow(title, artistStr) { const as = splitArtists(artistStr); if (!as.length) return null; return as.length > 1 ? [cleanTitle(title), as[0], as.slice(1, 4)] : [cleanTitle(title), as[0]]; }
 function parseCSV(txt) {
   const first = txt.split(/\r?\n/, 1)[0];
@@ -399,16 +819,20 @@ function parseCSV(txt) {
   if (f || row.length) { row.push(f); rows.push(row); }
   if (rows.length < 2) return null;
   const h = rows[0].map(x => x.trim().toLowerCase());
-  const ai = h.findIndex(x => /^(artist ?name\(s\)|artist ?names?|artists?|artist\(s\)|creator|performer|band)$/.test(x));
-  const ti = h.findIndex(x => /^(track ?name|track ?title|track|title|song|song ?name|name)$/.test(x));
+  const ai = h.findIndex(x => /^(artist ?name\(s\)|artist ?names?|artists?|artist\(s\)|creator|performer|band|interpret)$/.test(x));
+  const ti = h.findIndex(x => /^(track ?name|track ?title|track|title|song|song ?name|name|titel)$/.test(x));
   if (ai < 0) return null;
   return rows.slice(1).map(r => trackRow(ti >= 0 ? r[ti] : '', r[ai])).filter(Boolean);
 }
+const DUR = /^\d{1,2}:\d{2}(:\d{2})?$/;
 function parseLine(l) {
-  l = l.replace(/^\s*(\d{1,4}[.)]\s+|[-*•]\s+)/, '').trim(); if (!l || l.startsWith('#')) return null;
+  if (/\t/.test(l)) { // Apple Music / iTunes copy: Name, Time, Artist, Album, ...
+    const f = l.split('\t').map(x => x.trim()).filter(x => x && !DUR.test(x) && !/^\d+$/.test(x));
+    if (f.length >= 2) return trackRow(f[0], f[1]);
+  }
+  l = l.replace(/^\s*(\d{1,4}[.)]\s+|[-*•]\s+)/, '').trim(); if (!l || l.startsWith('#') || /^https?:\/\//.test(l)) return null;
   let m = /^(.+?)\s+[-–—]\s+(.+)$/.exec(l); if (m) return trackRow(m[2], m[1]);
   m = /^(.+?)\s+by\s+(.+)$/i.exec(l); if (m) return trackRow(m[1], m[2]);
-  m = /^(.+?)\t(.+)$/.exec(l); if (m) return trackRow(m[2], m[1]);
   return l.length < 80 ? trackRow('', l) : null; // a bare line is an artist name
 }
 function parseM3U(txt) {
@@ -418,8 +842,8 @@ function parseM3U(txt) {
     if (l.startsWith('#EXTINF')) { pending = parseLine(l.replace(/^#EXTINF:[^,]*,/, '')); continue; }
     if (l.startsWith('#')) continue;
     if (pending) { out.push(pending); pending = null; continue; }
-    const base = decodeURIComponent(l.split(/[\\/]/).pop()).replace(/\.[a-z0-9]{2,4}$/i, '').replace(/_/g, ' ');
-    const r = parseLine(base); if (r && r[0]) out.push(r);
+    let base = l.split(/[\\/]/).pop(); try { base = decodeURIComponent(base); } catch { }
+    const r = parseLine(base.replace(/\.[a-z0-9]{2,4}$/i, '').replace(/_/g, ' ')); if (r && r[0]) out.push(r);
   }
   return out;
 }
@@ -428,14 +852,13 @@ function parseXSPF(txt) {
   return [...doc.getElementsByTagName('track')].map(t => trackRow(t.getElementsByTagName('title')[0]?.textContent, t.getElementsByTagName('creator')[0]?.textContent)).filter(Boolean);
 }
 function parseJSON(txt) {
-  const out = []; const seen = new WeakSet();
+  const out = [], seen = new WeakSet();
   const walk = o => {
     if (!o || typeof o !== 'object' || seen.has(o) || out.length > 20000) return; seen.add(o);
     if (!Array.isArray(o)) {
-      const ak = Object.keys(o).find(k => /^(artistname|artist|artist_name|creator|artists)$/i.test(k));
-      const tk = Object.keys(o).find(k => /^(trackname|track_name|title|track|name|song)$/i.test(k));
-      let av = ak && o[ak]; if (Array.isArray(av)) av = av.map(x => typeof x === 'string' ? x : x?.name).filter(Boolean).join(';');
-      else if (av && typeof av === 'object') av = av.name;
+      const ak = Object.keys(o).find(k => /^(artistname|artist|artist_name|creator|artists|master_metadata_album_artist_name)$/i.test(k));
+      const tk = Object.keys(o).find(k => /^(trackname|track_name|title|track|name|song|master_metadata_track_name)$/i.test(k));
+      let av = ak && o[ak]; if (Array.isArray(av)) av = av.map(x => typeof x === 'string' ? x : x?.name).filter(Boolean).join(';'); else if (av && typeof av === 'object') av = av.name;
       if (typeof av === 'string' && av && (!tk || typeof o[tk] === 'string')) { const r = trackRow(tk ? o[tk] : '', av); if (r) { out.push(r); return; } }
     }
     for (const v of Object.values(o)) walk(v);
@@ -449,558 +872,337 @@ function parseAny(txt, name = '') {
   if (ext === 'xspf' || /^\s*(<\?xml|<playlist)/.test(txt)) return parseXSPF(txt);
   if (['json', 'jspf'].includes(ext) || /^\s*[[{]/.test(txt)) { try { return parseJSON(txt); } catch { } }
   if (['m3u', 'm3u8'].includes(ext) || /^#EXTM3U/.test(txt)) return parseM3U(txt);
-  if (['csv', 'tsv'].includes(ext) || /^[^\n]*(artist|creator)[^\n]*[,;\t]/i.test(txt)) { const r = parseCSV(txt); if (r && r.length) return r; }
+  if (['csv', 'tsv'].includes(ext) || /^[^\n]*(artist|creator|interpret)[^\n]*[,;\t]/i.test(txt)) { const r = parseCSV(txt); if (r && r.length) return r; }
   return txt.split(/\r?\n/).map(parseLine).filter(Boolean);
 }
 async function importDeezer(url) {
-  const m = /deezer\.com\/(?:[a-z]{2}\/)?(playlist|album)\/(\d+)/i.exec(url) || /^(playlist|album)?\s*(\d{4,})$/.exec(url.trim());
-  if (!m) throw new Error('That is not a Deezer playlist or album link.');
-  const kind = (m[1] || 'playlist').toLowerCase(), id = m[2];
+  const m = /deezer\.com\/(?:[a-z]{2}(?:-[a-z]{2})?\/)?(playlist|album)\/(\d+)/i.exec(url);
+  if (!m) throw new Error('link');
+  const kind = m[1].toLowerCase(), id = m[2];
   const info = await dz(`${kind}/${id}`);
   const rows = []; let index = 0;
   while (index < 3000) {
     const page = await dz(`${kind}/${id}/tracks`, { index, limit: 100 });
-    for (const t of page.data || []) rows.push([t.title_short || t.title, t.artist?.name || '']);
+    for (const t of page.data || []) if (t.artist?.name) rows.push([t.title_short || t.title, t.artist.name]);
     if (!page.next || !(page.data || []).length) break; index += 100;
   }
-  return { name: info.title || 'Deezer ' + kind, rows: rows.filter(r => r[1]) };
+  return { name: info.title || 'Deezer ' + kind, rows };
+}
+function linkKind(v) {
+  if (/deezer\.page\.link|link\.deezer\.com/i.test(v)) return 'deezer-short';
+  if (/deezer\.com/i.test(v)) return 'deezer';
+  if (/spotify\.com|spotify:/i.test(v)) return 'spotify';
+  if (/music\.apple\.com|itunes\.apple\.com/i.test(v)) return 'apple';
+  if (/youtube\.com|youtu\.be/i.test(v)) return 'youtube';
+  if (/soundcloud\.com|tidal\.com|amazon\.|qobuz\.com|pandora\.com/i.test(v)) return 'other';
+  return '';
 }
 function addCrate(name, rows, src) {
-  if (!rows.length) { toast('No tracks or artists found in that. Check the format and try again.'); return false; }
+  rows = rows.filter(r => r && r[1]);
+  if (!rows.length) { toast('No songs or artists found in that. Check the format and try again.'); return false; }
   S.crates.unshift({ id: uid(), name: String(name).slice(0, 80) || 'Imported playlist', src, ts: Date.now(), tracks: rows.slice(0, 5000) });
-  save(); resetDiscovery();
+  save(true); tasteChanged();
   const ar = new Set(rows.map(r => norm(r[1]))).size;
-  toast(`Imported ${plural(rows.length, 'row')} with ${plural(ar, 'artist')}. Your feed now digs from them.`);
+  toast(`Added ${plural(rows.length, 'song')} from ${plural(ar, 'artist')}. Your feed now digs from them.`);
   return true;
 }
-
-/* ================= components ================= */
-const avatar = (p, lg) => p.ch
-  ? `<a class="av ch${lg ? ' lg' : ''}" href="#/genre/${p.ch.id}" aria-hidden="true" tabindex="-1">${esc(p.ch.name[0] || '#')}</a>`
-  : `<a class="av${lg ? ' lg' : ''}" style="--h:${p.c | 0}" href="${p.self ? '#/me' : '#/p/' + esc(p.k)}" aria-hidden="true" tabindex="-1">${esc((p.h || '?')[0])}</a>`;
-function trackHTML(t, ctx, opts = {}) {
-  reg(t);
-  const p = isPlaying(t.id);
-  return `<div class="trk${p ? ' playing' : ''}${opts.n ? ' num' : ''}">
-    ${opts.n ? `<span class="n">${opts.n}</span>` : ''}
-    <button class="art" data-act="play" data-id="${t.id}" data-ctx="${ctx}" data-pl="${t.id}" aria-label="Play ${esc(t.t)}">${t.c ? `<img src="${coverUrl(t.c, 120)}" alt="" loading="lazy">` : ''}<span>${p ? I.pause : I.play}</span></button>
-    <div class="t"><b>${esc(t.t)}</b><a href="#/artist/${t.ai}">${esc(t.a)}</a>${opts.sub ? `<small>${esc(opts.sub)}</small>` : ''}</div>
-    <div class="ra">${opts.pick ? '' : `
-      <button class="icon${isFound(t.id) ? ' on' : ''}" data-act="save" data-id="${t.id}" aria-label="Save to finds">${I.heart}</button>
-      <button class="icon" data-act="compose" data-id="${t.id}" aria-label="Post about this track">${I.post}</button>`}</div>
-  </div>`;
-}
-function sleeveHTML(c) {
-  const t = c.tr; reg(t);
-  const p = isPlaying(t.id), img = coverUrl(t.c, 400);
-  const via = c.via.slice(0, 2), more = c.via.length - via.length;
-  return `<article class="sleeve${p ? ' playing' : ''}" data-card="${t.id}">
-    <div class="jacket"><div class="vinyl" style="--lbl:url('${coverUrl(t.c, 120)}')"></div>${img ? `<img src="${img}" alt="Cover of ${esc(t.al)}" loading="lazy">` : '<div class="noart"></div>'}</div>
-    <div class="info">
-      <h3>${esc(t.t)}</h3>
-      <p class="by"><a href="#/artist/${c.artist.id}">${esc(c.artist.name)}</a> <span class="muted small">${fmtN(c.artist.fans)} fans</span></p>
-      <p class="alb">${esc(t.al)}</p>
-      <div class="tag">Near <b>${via.map(esc).join('</b> and <b>')}</b>${more > 0 ? ` and ${more} more of yours` : ''}</div>
-    </div>
-    <div class="acts">
-      <button class="playbtn" data-act="play" data-id="${t.id}" data-ctx="foryou" data-pl="${t.id}">${p ? I.pause + 'Pause' : I.play + 'Play preview'}</button>
-      <button class="icon${isFound(t.id) ? ' on' : ''}" data-act="save" data-id="${t.id}" data-via="${esc(via.join(', '))}" aria-label="Save to finds">${I.heart}</button>
-      <button class="icon" data-act="compose" data-id="${t.id}" aria-label="Post about this track">${I.post}</button>
-      <button class="icon nope" data-act="nope" data-artist="${c.artist.id}" data-name="${esc(c.artist.name)}" aria-label="Not for me: hide ${esc(c.artist.name)}">${I.nope}</button>
-    </div>
-  </article>`;
-}
-function postHTML(p, author, ctx, focus) {
-  const t = p.tr;
-  const name = author.ch ? esc(author.ch.name) : '@' + esc(author.h);
-  const href = author.ch ? '#/genre/' + author.ch.id : author.self ? '#/me' : '#/p/' + esc(author.k);
-  return `<article class="post${focus ? ' focus' : ''}" id="post-${esc(p.id)}">
-    ${avatar(author)}
-    <div>
-      ${p.rp ? `<div class="rp">${I.repost.replace('<svg', '<svg style="width:14px;height:14px;vertical-align:-2px"')} reposted from @${esc(p.rp.h)}</div>` : ''}
-      <div class="who"><a href="${href}">${name}</a>${author.ch ? '<span class="chip-ch">Channel</span>' : ''}<span>${author.ch ? 'today' : ago(p.ts)}</span></div>
-      ${p.note ? `<p class="note">${esc(p.note)}</p>` : '<div style="height:8px"></div>'}
-      ${trackHTML(t, ctx, { sub: t.al })}
-      ${!author.self ? `<div class="row" style="margin-top:6px"><button class="btn sm" data-act="repost" data-id="${t.id}" data-from="${esc(author.ch ? author.ch.name : author.h)}">Repost</button></div>`
-      : `<div class="row" style="margin-top:6px"><button class="btn sm" data-act="delpost" data-post="${esc(p.id)}">Delete</button></div>`}
-    </div>
-  </article>`;
-}
-const meAuthor = () => ({ self: true, h: S.me.handle, c: S.me.hue, k: S.me.key });
-const loading = msg => `<div class="loading">${esc(msg)}</div>`;
-function head(title, back) {
-  return `<div class="head"><h1>${back ? `<a href="${back}" onclick="if(history.length>1){history.back();return false}" aria-label="Back">${I.back}</a>` : ''}${esc(title)}</h1></div>`;
+function tasteChanged() {
+  resetGraph(); flushReady(); emptyFills = 0;
+  G.shownA = new Set(SL.map(s => s.item.artist && s.item.artist.id).filter(Boolean));
+  ensureAhead(); renderStart();
 }
 
-/* ================= modal ================= */
-const modal = $('#modal');
-function openModal(title, body) {
-  $('#modalBody').innerHTML = `<div class="mhead"><h2>${esc(title)}</h2><button class="icon" data-act="close" aria-label="Close">${I.x}</button></div><div class="mbody">${body}</div>`;
-  if (!modal.open) modal.showModal();
+/* ================= import: screenshots, read on this device ================= */
+let tessP = null;
+function loadTesseract() {
+  if (window.Tesseract) return Promise.resolve();
+  return tessP ||= new Promise((res, rej) => {
+    const s = document.createElement('script'); s.src = 'https://cdn.jsdelivr.net/npm/tesseract.js@6.0.1/dist/tesseract.min.js';
+    s.onload = res; s.onerror = () => { tessP = null; s.remove(); rej(new Error('ocr')); }; document.head.appendChild(s);
+  });
 }
-modal.addEventListener('click', e => { if (e.target === modal) modal.close(); });
+async function prepImage(file) {
+  const bmp = await createImageBitmap(file);
+  const scale = clamp(1400 / bmp.width, 1, 2.5), w = Math.round(bmp.width * scale), h = Math.round(bmp.height * scale);
+  const c = document.createElement('canvas'); c.width = w; c.height = h;
+  const g = c.getContext('2d', { willReadFrequently: true }); g.drawImage(bmp, 0, 0, w, h); if (bmp.close) bmp.close();
+  const im = g.getImageData(0, 0, w, h), d = im.data; let sum = 0;
+  for (let i = 0; i < d.length; i += 4) { const y = .299 * d[i] + .587 * d[i + 1] + .114 * d[i + 2]; d[i] = y; sum += y; }
+  const inv = sum / (d.length / 4) < 128; // dark mode screenshots read better inverted
+  for (let i = 0; i < d.length; i += 4) { let y = d[i]; if (inv) y = 255 - y; y = clamp((y - 128) * 1.5 + 128, 0, 255); d[i] = d[i + 1] = d[i + 2] = y; }
+  g.putImageData(im, 0, 0);
+  return c;
+}
+const OCR_NOISE = /^(shuffle|play|playing|liked songs|add to playlist|add songs|download(ed)?|search|home|library|your library|premium|sort|filter|edit|share|songs?|albums?|artists?|playlists?|recommended|explore|following|follow|more|now playing|up next|queue|lyrics|related|for you|radio|browse|listen now|e)$/i;
+function cleanOCR(l) {
+  return l.replace(/[|¦©®™“”"«»]/g, ' ').replace(/^[^\p{L}\p{N}(]+/u, '').replace(/^E\s+(?=\p{L})/u, '').replace(/\s+\d{1,2}:\d{2}\b.*$/, '')
+    .replace(/\s+[^\p{L}\p{N})\]!?]+$/u, '').replace(/\s{2,}/g, ' ').trim();
+}
+function ocrLines(text) {
+  return text.split('\n').map(cleanOCR).filter(l => l.length >= 2 && /\p{L}/u.test(l) && !OCR_NOISE.test(l) && !/^\d+ (songs?|titles?|tracks?)/i.test(l) && (l.match(/\p{L}/gu) || []).length / l.length > .45);
+}
+async function matchOCR(lines, onStep) {
+  const out = [], seen = new Set();
+  const accept = (r, t, a) => r && titleSim(t, r.t) >= .62 && (dice(norm(a), norm(r.a)) >= .55 || (norm(r.a).length > 2 && norm(a).includes(norm(r.a))));
+  const push = r => { if (!seen.has(r.id)) { seen.add(r.id); out.push(r); } };
+  for (let i = 0; i < lines.length; i++) {
+    onStep(i, lines.length, out.length);
+    const T = lines[i], A = (lines[i + 1] || '').split(/\s*[•·∙|]\s*|\s+-\s+|,\s*/)[0];
+    try {
+      if (A) {
+        let r = (await api.searchTrack(`artist:"${A}" track:"${T}"`, 3)).find(x => accept(x, T, A));
+        if (!r) r = (await api.searchTrack(`${T} ${A}`, 5)).find(x => accept(x, T, A));
+        if (r) { push(r); i++; continue; }
+      }
+      const parts = T.split(/\s+[-–—•·]\s+/);
+      if (parts.length === 2) {
+        const r = (await api.searchTrack(`${parts[0]} ${parts[1]}`, 5)).find(x => accept(x, parts[1], parts[0]) || accept(x, parts[0], parts[1]));
+        if (r) push(r);
+      }
+    } catch { }
+  }
+  onStep(lines.length, lines.length, out.length);
+  return out;
+}
 
-function compose(trackId, presetNote = '', rp = null) {
-  const tr = trackId ? TR.get(trackId) : null;
-  const body = `
-    <div id="cpick">${tr ? trackHTML(tr, 'compose', { pick: true, sub: tr.al }) : `
-      <label class="f" for="cq">Find a track</label>
-      <input type="search" id="cq" placeholder="Song or artist" autocomplete="off">
-      <div class="results" id="cres"></div>`}</div>
-    <label class="f" for="cnote">Say why it's good</label>
-    <textarea id="cnote" maxlength="280" placeholder="The bass line at 0:40. That's it, that's the post.">${esc(presetNote)}</textarea>
-    <div class="mfoot"><span class="count" id="ccount">${280 - presetNote.length}</span><button class="btn" data-act="close">Cancel</button><button class="btn primary" id="cpost" ${tr ? '' : 'disabled'}>Post</button></div>`;
-  openModal(rp ? 'Repost' : 'Share a find', body);
-  let chosen = tr;
-  const note = $('#cnote');
-  note.oninput = () => { $('#ccount').textContent = 280 - note.value.length; };
-  $('#cpost').onclick = () => {
-    if (!chosen) return;
-    addPost(chosen, note.value.trim(), rp);
-    modal.close(); toast(rp ? 'Reposted to your profile.' : 'Posted to your profile. Share your profile link so friends see it.');
-    if (curRoute === 'home' || curRoute === 'me') route();
-  };
-  const q = $('#cq');
-  if (q) {
-    q.focus();
-    q.oninput = debounce(async () => {
-      const v = q.value.trim(); const box = $('#cres'); if (!v) { box.innerHTML = ''; return; }
-      box.innerHTML = loading('Searching');
-      const res = await api.searchTrack(v).catch(() => null);
-      if (q.value.trim() !== v) return;
-      box.innerHTML = !res ? '<p class="muted">Search failed. Check your connection.</p>' : !res.length ? '<p class="muted">No tracks match that.</p>'
-        : res.map(t => `<div data-choose="${reg(t)}">${trackHTML(t, 'compose', { pick: true, sub: t.al })}</div>`).join('');
-    }, 300);
-    $('#cres').addEventListener('click', e => {
-      const row = e.target.closest('[data-choose]'); if (!row || e.target.closest('.art,a')) return;
-      chosen = TR.get(+row.dataset.choose);
-      $('#cpick').innerHTML = trackHTML(chosen, 'compose', { pick: true, sub: chosen.al }) + '<button class="btn sm" id="cchange" style="margin-top:4px">Pick another</button>';
-      $('#cchange').onclick = () => compose(null, note.value);
-      $('#cpost').disabled = false; note.focus();
+/* ================= start screen ================= */
+const startEl = $('#start');
+function renderStart() {
+  if (started) { startEl.hidden = true; return; }
+  startEl.hidden = false;
+  if (hasTaste()) {
+    const names = seedList().slice(0, 3).map(s => s.name);
+    startEl.classList.add('over');
+    startEl.innerHTML = `<div class="sbox">
+      <h1>New music, one song at a time.</h1>
+      <p>Picked from artists near ${esc(names.join(', '))}${seedList().length > 3 ? ' and the rest of your music' : ''}. Scroll for the next song and like the ones you love.</p>
+      <div class="go row"><button class="bigplay" id="go">${I.play}Start listening</button><button class="pill" id="golib">Library</button></div></div>`;
+    $('#go').onclick = start;
+    $('#golib').onclick = () => openSheet();
+  } else {
+    startEl.classList.remove('over');
+    startEl.innerHTML = `<div class="sbox">
+      <h1>Endless new music from the music you already love.</h1>
+      <p>Bring a playlist from any app. Liner plays you artists that sit next to yours, one full-screen song at a time, and learns from what you like.</p>
+      <div class="choices">
+        <button class="choice main" data-open="shots">${I.shot}<b>Screenshots of a playlist</b><small>Works with Spotify, Apple Music, YouTube Music and any other app</small></button>
+        <button class="choice" data-open="file">${I.file}<b>A playlist link or file</b><small>Deezer links, Exportify CSV, M3U, pasted lists</small></button>
+      </div>
+      <p style="font-size:15px;margin-top:22px">Or name a few artists</p>
+      <div class="sugg" style="margin-top:8px"><input type="search" id="obq" placeholder="Start typing an artist" autocomplete="off" aria-label="Search for an artist"><ul id="obs" hidden></ul></div>
+      <div class="chips" id="obchips"></div>
+      <button class="bigplay" id="obgo" hidden>${I.play}Start listening</button>
+    </div>`;
+    $$('[data-open]', startEl).forEach(b => b.onclick = () => openSheet(b.dataset.open));
+    wireArtistPicker($('#obq'), $('#obs'), $('#obchips'), picked => {
+      const go = $('#obgo'); go.hidden = !picked.size;
+      go.onclick = () => { if (addCrate('Artists I picked', [...picked.values()].map(a => ['', a.name]), 'picked')) start(); };
     });
   }
 }
-function editProfile() {
-  openModal('Edit profile', `
-    <label class="f" for="eh">Handle</label><input type="text" id="eh" maxlength="20" value="${esc(S.me.handle)}">
-    <p class="small muted" style="margin:4px 0 0">Letters, numbers, dots and underscores.</p>
-    <label class="f" for="eb">Bio</label><textarea id="eb" maxlength="160" rows="3">${esc(S.me.bio)}</textarea>
-    <label class="f" for="ec">Color</label><div class="row" style="flex-wrap:nowrap"><span class="av" id="eav" style="--h:${S.me.hue}">${esc(S.me.handle[0])}</span><input type="range" class="hue" id="ec" min="0" max="359" value="${S.me.hue}"></div>
-    <div class="mfoot"><button class="btn" data-act="close">Cancel</button><button class="btn primary" id="esave">Save profile</button></div>`);
-  $('#ec').oninput = e => { $('#eav').style.setProperty('--h', e.target.value); };
-  $('#esave').onclick = () => {
-    const h = $('#eh').value.trim().replace(/[^\w.]/g, '').slice(0, 20);
-    if (h.length < 2) { toast('Handles need at least 2 characters.'); return; }
-    S.me.handle = h; S.me.bio = $('#eb').value.trim().slice(0, 160); S.me.hue = +$('#ec').value; save();
-    modal.close(); toast('Profile saved.'); renderShell(); route();
-  };
-}
-
-/* ================= router & views ================= */
-const view = $('#view');
-let curRoute = '', renderId = 0;
-function route() {
-  const h = location.hash.slice(2) || 'home';
-  const [r, ...rest] = h.split('/'); const arg = rest.join('/');
-  curRoute = r; const my = ++renderId;
-  $$('[data-nav]').forEach(a => a.classList.toggle('on', a.dataset.nav === r || (r === 'home' && !a.dataset.nav)));
-  const V = { home: vHome, explore: vExplore, library: vLibrary, people: vPeople, me: vMe, artist: vArtist, genre: vGenre, u: vIncoming, p: vPerson, search: vExplore }[r] || vHome;
-  window.scrollTo(0, 0);
-  Promise.resolve(V(arg, my)).catch(err => { console.error(err); if (my === renderId) view.innerHTML += `<div class="empty"><h2>That didn't load</h2><p>${esc(err.message)}. Check your connection and reload.</p></div>`; });
-  renderRail();
-}
-const stale = my => my !== renderId;
-
-/* ---------- home ---------- */
-let homeTab = 'foryou', io;
-async function vHome(_, my) {
-  const t = homeTab;
-  view.innerHTML = `<div class="head"><h1>Home</h1><div class="tabs" role="tablist">
-      <button role="tab" class="${t === 'foryou' ? 'on' : ''}" data-act="htab" data-tab="foryou" aria-selected="${t === 'foryou'}">For you</button>
-      <button role="tab" class="${t === 'following' ? 'on' : ''}" data-act="htab" data-tab="following" aria-selected="${t === 'following'}">Following</button></div></div>
-    <div id="hbody"></div>`;
-  return t === 'foryou' ? forYou(my) : followingFeed(my);
-}
-async function forYou(my) {
-  const body = $('#hbody');
-  if (!seedList().length && !S.trail) { body.innerHTML = onboardHTML(); wireOnboard(); return; }
-  body.innerHTML = `
-    ${S.trail ? `<div class="trailbar">On a trail from <b>${esc(S.trail.name)}</b><button data-act="endtrail">End trail</button></div>` : ''}
-    <div class="dial"><label for="dial">Familiar</label><input type="range" id="dial" min="0" max="1" step=".05" value="${S.dial}" aria-label="From familiar to deep cuts"><span>Deep cuts</span></div>
-    <div id="cards"></div><div id="more"></div>`;
-  $('#dial').onchange = e => { S.dial = +e.target.value; save(); resetDiscovery(true); forYou(renderId); };
-  CTX.foryou = () => D.cards.map(c => c.tr);
-  const cards = $('#cards');
-  if (D.cards.length) cards.innerHTML = D.cards.map(sleeveHTML).join('');
-  else { $('#more').innerHTML = loading('Digging through artists near yours'); await digMore(); if (stale(my)) return; cards.innerHTML = D.cards.map(sleeveHTML).join(''); }
-  setMore();
-  io?.disconnect();
-  io = new IntersectionObserver(async es => {
-    if (!es[0].isIntersecting || D.busy || D.exhausted || stale(my)) return;
-    $('#more').innerHTML = loading('Digging further');
-    await digMore(); if (stale(my)) return; renderMoreCards();
-  }, { rootMargin: '600px' });
-  io.observe($('#more'));
-}
-function setMore() {
-  const m = $('#more'); if (!m) return;
-  m.innerHTML = D.exhausted ? `<div class="empty"><h2>You've dug this crate out</h2><p>Import another playlist, follow a friend and blend their taste, or start a trail from any artist in Explore.</p><a class="btn" href="#/explore">Go to Explore</a></div>`
-    : !D.cards.length ? `<div class="empty"><h2>Nothing turned up yet</h2><p>Deezer didn't recognise enough of your artists. Add a few by name below or import another playlist.</p><a class="btn" href="#/library">Open Library</a></div>` : '';
-}
-function renderMoreCards() {
-  const cards = $('#cards'); if (!cards) return;
-  const have = new Set($$('[data-card]', cards).map(e => +e.dataset.card));
-  cards.insertAdjacentHTML('beforeend', D.cards.filter(c => !have.has(c.tr.id)).map(sleeveHTML).join(''));
-  setMore();
-  // keep the observer firing when the new cards don't fill the viewport
-  const m = $('#more'); if (m && !D.exhausted && m.getBoundingClientRect().top < innerHeight + 600) { io?.unobserve(m); io?.observe(m); }
-}
-function onboardHTML() {
-  return `<div class="onboard">
-    <h2>Start from the music you already love</h2>
-    <p>Liner looks at the artists in your playlists, walks to the artists that sit next to them, and plays you a preview from each. Nothing you import leaves this browser.</p>
-    <div class="row" style="margin:18px 0 26px"><a class="btn primary" href="#/library">Import a playlist</a></div>
-    <label class="f" for="obq">Or name a few artists</label>
-    <div class="sugg"><input type="search" id="obq" placeholder="Start typing an artist" autocomplete="off"><ul id="obs" hidden></ul></div>
-    <div class="chips" id="obchips" style="margin:12px 0"></div>
-    <button class="btn blue" id="obgo" disabled>Start digging</button>
-  </div>`;
-}
-function wireOnboard() {
-  const picked = new Map();
-  const q = $('#obq'), list = $('#obs');
-  const draw = () => {
-    $('#obchips').innerHTML = [...picked.values()].map(a => `<span class="chip">${esc(a.name)}<button data-rm="${a.id}" aria-label="Remove ${esc(a.name)}">×</button></span>`).join('');
-    $('#obgo').disabled = picked.size < 1; $('#obgo').textContent = picked.size < 3 ? `Start digging${picked.size ? '' : ''}` : `Start digging from ${picked.size} artists`;
-  };
+function wireArtistPicker(q, list, chips, onChange) {
+  const picked = new Map(); let found = [];
+  const draw = () => { chips.innerHTML = [...picked.values()].map(a => `<span class="chip">${esc(a.name)}<button data-rm="${a.id}" aria-label="Remove ${esc(a.name)}">×</button></span>`).join(''); onChange(picked); };
   q.oninput = debounce(async () => {
     const v = q.value.trim(); if (!v) { list.hidden = true; return; }
     const r = await api.searchArtist(v).catch(() => []);
     if (q.value.trim() !== v) return;
-    list.innerHTML = r.map(a => `<li><button data-add='${esc(JSON.stringify(a))}'>${a.p ? `<img src="${artUrl(a.p, 56)}" alt="">` : '<img alt="">'}<span>${esc(a.name)} <small class="muted">${fmtN(a.fans)} fans</small></span></button></li>`).join('');
+    found = r;
+    list.innerHTML = r.map((a, i) => `<li><button type="button" data-i="${i}">${a.p ? `<img src="${artUrl(a.p, 56)}" alt="">` : '<img alt="">'}<span>${esc(a.name)} <small class="muted">${fmtN(a.fans)} fans</small></span></button></li>`).join('');
     list.hidden = !r.length;
   }, 250);
-  list.onclick = e => { const b = e.target.closest('[data-add]'); if (!b) return; const a = JSON.parse(b.dataset.add); picked.set(a.id, a); q.value = ''; list.hidden = true; q.focus(); draw(); };
-  $('#obchips').onclick = e => { const b = e.target.closest('[data-rm]'); if (b) { picked.delete(+b.dataset.rm); draw(); } };
-  $('#obgo').onclick = () => {
-    const rows = [...picked.values()].map(a => ['', a.name]);
-    addCrate('Artists I picked', rows, 'picked'); vHome('', renderId); renderRail();
-  };
+  list.onclick = e => { const b = e.target.closest('[data-i]'); if (!b) return; const a = found[+b.dataset.i]; picked.set(a.id, a); q.value = ''; list.hidden = true; q.focus(); draw(); };
+  chips.onclick = e => { const b = e.target.closest('[data-rm]'); if (b) { picked.delete(+b.dataset.rm); draw(); } };
 }
-async function followingFeed(my) {
-  const body = $('#hbody');
-  const items = S.posts.map(p => ({ p, au: meAuthor() }));
-  for (const f of S.following) for (const p of f.p) items.push({ p, au: f });
-  const chans = S.channels.length;
-  if (!items.length && !chans) {
-    body.innerHTML = `<div class="empty"><h2>No posts yet</h2><p>Follow a channel in Explore for daily picks, paste a friend's profile link in People, or post a find yourself.</p><div class="row" style="justify-content:center"><a class="btn" href="#/explore">Browse channels</a><a class="btn" href="#/people">Add a friend</a></div></div>`;
-    return;
-  }
-  const draw = extra => {
-    const all = items.concat(extra).sort((a, b) => b.p.ts - a.p.ts);
-    CTX.following = () => all.map(x => x.p.tr);
-    body.innerHTML = all.map(x => postHTML(x.p, x.au, 'following')).join('') || '';
-  };
-  draw([]);
-  if (chans) {
-    body.insertAdjacentHTML('afterbegin', loading('Loading channel picks'));
-    const extra = (await Promise.all(S.channels.map(id => channelPosts(id).catch(() => [])))).flat().map(p => ({ p, au: { ch: p.ch } }));
-    if (stale(my) || homeTab !== 'following') return;
-    draw(extra);
-  }
+function start() {
+  if (!hasTaste() || started) return;
+  unlockAudio(); // must happen inside the tap
+  started = true; startEl.hidden = true;
+  if (cur >= 0 && cur < SL.length) { playSlide(SL[cur]); ensureAhead(); }
+  else if (SL.length) { activate(0); snapTo(0, true); }
+  else { cur = SL.length; ensureAhead(); }
+  setTimeout(learnRefs, 6000);
 }
 
-/* ---------- explore ---------- */
-async function vExplore(arg, my) {
-  view.innerHTML = `${head('Explore')}
-    <div class="section"><label class="sr" for="xq">Search</label><input type="search" id="xq" placeholder="Search artists and tracks" value="${esc(decodeURIComponent(arg || ''))}" autocomplete="off"></div>
-    <div id="xres"></div>
-    <div id="xdefault"><div class="section" style="border:0;padding-bottom:6px"><h2>Channels</h2><p class="muted small">Daily picks from Deezer's genre charts. Follow one and its picks show up in your Following feed.</p></div><div class="genres" id="xgen">${loading('Loading channels')}</div>
-    <div class="section" style="border-top:1px solid var(--line);border-bottom:0;padding-bottom:4px"><h2>Charting today</h2></div><div id="xchart">${loading('Loading chart')}</div></div>`;
-  const q = $('#xq');
-  const search = async v => {
-    const res = $('#xres'), def = $('#xdefault');
-    if (!v) { res.innerHTML = ''; def.hidden = false; return; }
-    def.hidden = true; res.innerHTML = loading('Searching');
-    const [ar, tr] = await Promise.all([api.searchArtist(v).catch(() => []), api.searchTrack(v).catch(() => [])]);
-    if (q.value.trim() !== v || stale(my)) return;
-    CTX.search = () => tr;
-    res.innerHTML = (!ar.length && !tr.length) ? `<div class="empty"><h2>No matches</h2><p>Try a shorter name or check the spelling.</p></div>` :
-      `${ar.length ? `<div class="section" style="border:0;padding-bottom:4px"><h2>Artists</h2></div><div class="agrid">${ar.map(artistCard).join('')}</div>` : ''}
-       ${tr.length ? `<div class="section" style="border:0;padding-bottom:4px"><h2>Tracks</h2></div>${tr.map(t => trackHTML(t, 'search', { sub: t.al })).join('')}` : ''}`;
-  };
-  q.oninput = debounce(() => { const v = q.value.trim(); history.replaceState(null, '', '#/explore' + (v ? '/' + encodeURIComponent(v) : '')); search(v); }, 300);
-  if (arg) search(decodeURIComponent(arg));
-  const [gs, ch] = await Promise.all([api.genres().catch(() => []), api.chart().catch(() => [])]);
-  if (stale(my)) return;
-  $('#xgen').innerHTML = gs.map(g => `<a class="genre" href="#/genre/${g.id}"><img src="${esc(g.pic)}" alt="" loading="lazy"><span>${esc(g.name)}${S.channels.includes(g.id) ? ' (following)' : ''}</span></a>`).join('') || '<p class="muted">Channels did not load.</p>';
-  CTX.chart = () => ch;
-  $('#xchart').innerHTML = ch.map((t, i) => trackHTML(t, 'chart', { n: i + 1, sub: t.al })).join('') || '<p class="section muted">The chart did not load.</p>';
+/* ================= library sheet ================= */
+const sheet = $('#sheet');
+$('#libbtn').onclick = () => openSheet();
+sheet.addEventListener('click', e => { if (e.target === sheet) sheet.close(); });
+sheet.addEventListener('close', renderStart);
+function openSheet(focus) {
+  renderSheet();
+  if (!sheet.open) sheet.showModal();
+  if (focus) { const el = $(`[data-sec=${focus}]`, sheet); if (el) { el.scrollIntoView({ block: 'start' }); el.classList.add('main'); } }
 }
-const artistCard = a => `<a class="acard" href="#/artist/${a.id}">${a.p ? `<img src="${artUrl(a.p)}" alt="" loading="lazy">` : '<div class="noimg"></div>'}${esc(a.name)}<small>${fmtN(a.fans)} fans</small></a>`;
-
-async function vArtist(id, my) {
-  id = +id; view.innerHTML = head('Artist', '#/explore') + loading('Loading artist');
-  const [a, tops, rel] = await Promise.all([api.artist(id), api.top(id).catch(() => []), api.related(id).catch(() => [])]);
-  if (stale(my)) return;
-  const known = knownNames().has(norm(a.name));
-  CTX.artist = () => tops;
-  const q = encodeURIComponent(a.name);
-  view.innerHTML = head(a.name, '#/explore') + `
-    <div class="ghead">${a.p ? `<img src="${artUrl(a.p, 500)}" alt="">` : '<img alt="">'}<div><h2>${esc(a.name)}</h2><p>${fmtN(a.fans)} fans on Deezer${known ? '. Already in your taste.' : ''}</p>
-      <div class="row"><button class="btn blue" data-act="trail" data-id="${a.id}" data-name="${esc(a.name)}">Start a trail here</button>
-      ${known ? '' : `<button class="btn" data-act="addtaste" data-name="${esc(a.name)}">Add to my taste</button>`}</div>
-      <div class="row small" style="margin-top:10px"><a class="muted" href="https://www.deezer.com/artist/${a.id}" target="_blank" rel="noopener">Deezer</a><a class="muted" href="https://open.spotify.com/search/${q}" target="_blank" rel="noopener">Spotify</a><a class="muted" href="https://music.youtube.com/search?q=${q}" target="_blank" rel="noopener">YouTube Music</a><a class="muted" href="https://bandcamp.com/search?q=${q}" target="_blank" rel="noopener">Bandcamp</a></div></div></div>
-    <div class="section" style="border:0;padding-bottom:4px"><h2>Top tracks</h2></div>
-    ${tops.map((t, i) => trackHTML(t, 'artist', { n: i + 1, sub: t.al })).join('') || '<p class="section muted">No tracks found.</p>'}
-    ${rel.length ? `<div class="section" style="border-top:1px solid var(--line);border-bottom:0;padding-bottom:4px"><h2>Sounds near ${esc(a.name)}</h2></div><div class="agrid">${rel.slice(0, 18).map(artistCard).join('')}</div>` : ''}`;
-}
-async function vGenre(id, my) {
-  id = +id; view.innerHTML = head('Channel', '#/explore') + loading('Loading channel');
-  const [gs, arts] = await Promise.all([api.genres(), api.genreArtists(id).catch(() => [])]);
-  if (stale(my)) return;
-  const g = gs.find(x => x.id === id) || { name: 'Channel', pic: '' };
-  const on = S.channels.includes(id);
-  view.innerHTML = head(g.name, '#/explore') + `
-    <div class="ghead"><img src="${esc(g.pic)}" alt=""><div><h2>${esc(g.name)}</h2><p>Four picks a day from the artists charting in ${esc(g.name)} on Deezer.</p>
-      <button class="btn ${on ? '' : 'primary'}" data-act="chan" data-id="${id}">${on ? 'Following' : 'Follow channel'}</button></div></div>
-    <div class="section" style="border:0;padding-bottom:4px"><h2>Charting artists</h2></div>
-    <div class="agrid">${arts.map(artistCard).join('')}</div>`;
-}
-
-/* ---------- library ---------- */
-let libTab = 'crates';
-function vLibrary() {
-  const t = libTab;
-  view.innerHTML = `<div class="head"><h1>Library</h1><div class="tabs">
-      <button class="${t === 'crates' ? 'on' : ''}" data-act="ltab" data-tab="crates">Crates</button>
-      <button class="${t === 'finds' ? 'on' : ''}" data-act="ltab" data-tab="finds">Finds (${S.finds.length})</button></div></div><div id="lbody"></div>`;
-  t === 'crates' ? libCrates() : libFinds();
-}
-function libCrates() {
-  $('#lbody').innerHTML = `
-    <div class="section">
-      <h2>Import a playlist</h2>
-      <p class="muted small">Your playlists are the reference point: Liner digs from the artists in them and never recommends ones you already have.</p>
-      <div class="drop" id="drop" tabindex="0" role="button" aria-label="Choose playlist files"><div><b>Drop playlist files here</b><br><span class="muted small">or click to choose. CSV, M3U, M3U8, XSPF, JSPF, JSON or TXT</span></div></div>
-      <input type="file" id="file" multiple accept=".csv,.tsv,.m3u,.m3u8,.xspf,.jspf,.json,.txt" hidden>
-      <label class="f" for="dzurl">Deezer playlist or album link</label>
-      <div class="row" style="flex-wrap:nowrap"><input type="url" id="dzurl" placeholder="https://www.deezer.com/playlist/…"><button class="btn primary" id="dzgo">Import</button></div>
-      <label class="f" for="paste">Or paste a list</label>
-      <textarea id="paste" rows="4" placeholder="One per line: Artist - Song, Song by Artist, or just an artist name"></textarea>
-      <div class="row" style="margin-top:8px"><input type="text" id="pname" placeholder="Name this crate" style="flex:1;min-width:160px"><button class="btn primary" id="pgo">Import list</button></div>
-      <details style="margin-top:14px"><summary><b>Coming from Spotify, Apple Music or YouTube?</b></summary>
-        <ol class="steps small" style="margin-top:8px">
-          <li>Spotify: open <a href="https://exportify.app" target="_blank" rel="noopener">exportify.app</a>, sign in, export a playlist as CSV, then drop the file here. A full Spotify account data export (the JSON files) also works.</li>
-          <li>Apple Music or YouTube Music: export with a converter such as <a href="https://www.tunemymusic.com" target="_blank" rel="noopener">TuneMyMusic</a> to a CSV or TXT file.</li>
-          <li>Local files: save the playlist as M3U from your player (VLC, foobar2000, iTunes) and drop it here.</li>
-        </ol></details>
+function renderSheet() {
+  const ml = S.ml, refs = ml.pos.filter(e => e.src === 'ref').length, lk = ml.pos.filter(e => e.src === 'like').length;
+  $('#sheetBody').innerHTML = `
+    <div class="shead"><h2>Library</h2><button class="x" data-x aria-label="Close">${I.x}</button></div>
+    <div class="sec">
+      <h3>Add music</h3><p>Your playlists are the starting point. Liner never plays you artists you already have.</p>
+      <div class="imp">
+        <div class="opt" data-sec="shots"><b>Screenshots of a playlist</b>
+          <small>Scroll through a playlist in any app and take screenshots. The text is read on this device. The first time, the reader downloads once (about 6 MB).</small>
+          <button class="btn primary" id="shotbtn">Choose screenshots</button><input type="file" id="shotin" accept="image/*" multiple hidden>
+          <div id="shotout"></div></div>
+        <div class="opt" data-sec="file"><b>Playlist link</b>
+          <small>Deezer playlists and albums import directly. Paste a link from another app to see how to bring it over.</small>
+          <div class="row nw"><input type="url" id="link" placeholder="Paste a playlist link" aria-label="Playlist link"><button class="btn primary" id="linkgo">Import</button></div>
+          <div id="linkout"></div></div>
+        <div class="opt"><b>Playlist file</b>
+          <small>Exportify CSV, Spotify data export (JSON), M3U, XSPF, JSPF or TXT</small>
+          <div class="drop" id="drop" tabindex="0" role="button">Drop files here or click to choose</div><input type="file" id="filein" multiple accept=".csv,.tsv,.m3u,.m3u8,.xspf,.jspf,.json,.txt" hidden></div>
+        <div class="opt"><b>Paste a list</b>
+          <small>One song per line, like “Artist - Song”, or just artist names. In Apple Music or iTunes on a computer, select songs, copy and paste them here.</small>
+          <textarea id="paste" rows="4" aria-label="Songs or artists"></textarea>
+          <div class="row" style="margin-top:8px"><button class="btn primary" id="pastego">Add list</button></div></div>
+        <div class="opt"><b>Name artists</b>
+          <div class="sugg" style="margin-top:8px"><input type="search" id="lq" placeholder="Start typing an artist" autocomplete="off" aria-label="Search for an artist"><ul id="ls" hidden></ul></div>
+          <div class="chips" id="lchips"></div><button class="btn primary" id="lgo" hidden>Add artists</button></div>
+      </div>
     </div>
-    <div id="crates">${S.crates.length ? S.crates.map(crateHTML).join('') : '<div class="empty"><h2>No crates yet</h2><p>Import a playlist above to give Liner something to dig from.</p></div>'}</div>
-    <div class="section"><h2>Backup</h2><p class="muted small">Everything lives in this browser. Save a backup to move it to another device.</p>
-      <div class="row"><button class="btn" data-act="backup">Download backup</button><button class="btn" data-act="restore">Restore backup</button><input type="file" id="restorefile" accept=".json" hidden></div></div>`;
-  const drop = $('#drop'), file = $('#file');
-  const readFiles = async fs => {
-    for (const f of fs) {
-      if (f.size > 30e6) { toast(`${f.name} is too large.`); continue; }
-      const rows = parseAny(await f.text(), f.name);
-      addCrate(f.name.replace(/\.[^.]+$/, ''), rows, 'file');
+    <div class="sec"><h3>Your music</h3>
+      <div class="list">${S.crates.length ? S.crates.map(c => {
+        const cnt = new Map(); for (const [, a] of c.tracks) cnt.set(a, (cnt.get(a) || 0) + 1);
+        const top = [...cnt.entries()].sort((a, b) => b[1] - a[1]).slice(0, 4).map(x => x[0]);
+        return `<div class="it"><span class="stack">${c.tracks.length > 999 ? fmtN(c.tracks.length) : c.tracks.length}</span><div><b>${esc(c.name)}</b><small>${esc(top.join(', '))}</small></div><button class="btn sm" data-delcrate="${esc(c.id)}">Remove</button></div>`;
+      }).join('') : '<p class="muted small" style="margin:0">Nothing yet.</p>'}</div>
+    </div>
+    <div class="sec"><h3>Discovery</h3>
+      <div class="dial"><label for="dial">Familiar</label><input type="range" id="dial" min="0" max="1" step=".05" value="${S.dial}"><span>Deep cuts</span></div>
+      <p class="stat" style="margin-top:14px">The on-device model has learned the sound of <b>${plural(refs, 'song')}</b> from your playlists, <b>${plural(lk, 'like')}</b> and <b>${plural(ml.neg.length, 'skip')}</b>.</p>
+      <p class="muted small" style="margin:0">A song you leave within 7 seconds counts as a skip.${DATA.bytes ? ` Audio downloaded this session: ${(DATA.bytes / 1048576).toFixed(1)} MB.` : ''}${saveData ? ' Data saver is on, so Liner loads fewer songs ahead.' : ''}</p>
+      <div class="row" style="margin-top:10px"><button class="btn sm" id="forget">Reset what it learned</button></div>
+    </div>
+    <div class="sec"><h3>Liked songs</h3>
+      ${S.likes.length ? `<div class="row" style="margin-bottom:8px"><button class="btn sm" data-export="csv">Export CSV</button><button class="btn sm" data-export="txt">Export text</button></div>
+      <p class="muted small" style="margin:0 0 6px">Import the CSV into Spotify, Apple Music or YouTube Music with a tool like TuneMyMusic.</p>
+      <div class="list">${S.likes.map(l => `<div class="it"><img src="${coverUrl(l.c, 56)}" alt="" loading="lazy"><div><b>${esc(l.t)}</b><small>${esc(l.a)}</small></div><div class="ra"><button class="btn sm" data-playlike="${l.id}">Play</button><button class="btn sm" data-unlike="${l.id}" aria-label="Unlike ${esc(l.t)}">Unlike</button></div></div>`).join('')}</div>`
+      : '<p class="muted small" style="margin:0">Songs you like show up here.</p>'}
+    </div>
+    <div class="sec"><h3>Backup</h3><p>Everything is stored in this browser only.</p>
+      <div class="row"><button class="btn sm" id="bk">Download backup</button><button class="btn sm" id="rs">Restore backup</button><input type="file" id="rsin" accept=".json" hidden></div></div>`;
+  wireSheet();
+}
+function wireSheet() {
+  const b = $('#sheetBody');
+  $('[data-x]', b).onclick = () => sheet.close();
+  $('#shotbtn').onclick = () => $('#shotin').click();
+  $('#shotin').onchange = e => runOCR([...e.target.files]);
+  const linkgo = async () => {
+    const v = $('#link').value.trim(), out = $('#linkout'); if (!v) return;
+    const k = linkKind(v); out.innerHTML = '';
+    if (k === 'deezer') {
+      const btn = $('#linkgo'); btn.disabled = true; btn.textContent = 'Importing';
+      try { const { name, rows } = await importDeezer(v); if (addCrate(name, rows, 'deezer')) { renderSheet(); return; } }
+      catch (e) { out.innerHTML = `<div class="guide">${e.message === 'link' ? 'That Deezer link does not point to a playlist or album.' : 'Could not read that playlist. Make sure it is public.'}</div>`; }
+      btn.disabled = false; btn.textContent = 'Import'; return;
     }
-    libCrates(); renderRail();
+    const guides = {
+      'deezer-short': `Short Deezer links can't be opened from here. Open the link, copy the full address (it looks like deezer.com/playlist/123…) and paste that.`,
+      spotify: `Spotify only shares playlists with apps you sign in to, so Liner can't read this link. Two ways that work:<ol><li><b>Screenshots</b>: open the playlist on your phone, screenshot it while scrolling, and add the screenshots above.</li><li><b>Exportify</b>: open <a href="https://exportify.app" target="_blank" rel="noopener">exportify.app</a>, sign in with Spotify, click Export next to the playlist, then drop the CSV in Playlist file below.</li></ol>`,
+      apple: `Apple Music doesn't let other sites read playlists. Two ways that work:<ol><li><b>Screenshots</b> of the playlist, added above.</li><li>On a computer: open the playlist in Apple Music or iTunes, select all songs, copy, and paste into Paste a list below.</li></ol>`,
+      youtube: `YouTube doesn't let other sites read playlists. Take <b>screenshots</b> of the playlist in YouTube Music and add them above.`,
+      other: `That service doesn't let other sites read playlists. Take <b>screenshots</b> of the playlist and add them above.`,
+    };
+    out.innerHTML = `<div class="guide">${guides[k] || 'That does not look like a playlist link.'}</div>`;
   };
-  drop.onclick = () => file.click(); drop.onkeydown = e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); file.click(); } };
-  file.onchange = () => readFiles([...file.files]);
+  $('#linkgo').onclick = linkgo; $('#link').onkeydown = e => { if (e.key === 'Enter') linkgo(); };
+  const drop = $('#drop'), fin = $('#filein');
+  const readFiles = async fs => {
+    let any = false;
+    for (const f of fs) { if (f.size > 40e6) { toast(`${f.name} is too large.`); continue; } any = addCrate(f.name.replace(/\.[^.]+$/, ''), parseAny(await f.text(), f.name), 'file') || any; }
+    if (any) renderSheet();
+  };
+  drop.onclick = () => fin.click(); drop.onkeydown = e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); fin.click(); } };
+  fin.onchange = () => readFiles([...fin.files]);
   drop.ondragover = e => { e.preventDefault(); drop.classList.add('over'); };
   drop.ondragleave = () => drop.classList.remove('over');
   drop.ondrop = e => { e.preventDefault(); drop.classList.remove('over'); readFiles([...e.dataTransfer.files]); };
-  $('#dzgo').onclick = async () => {
-    const v = $('#dzurl').value.trim(); if (!v) return;
-    if (/spotify\.com|spotify:/.test(v)) { toast('Spotify links need a login. Export the playlist with exportify.app and drop the CSV here.'); return; }
-    const b = $('#dzgo'); b.disabled = true; b.textContent = 'Importing';
-    try { const { name, rows } = await importDeezer(v); addCrate(name, rows, 'deezer'); libCrates(); renderRail(); }
-    catch (e) { toast(e.message.startsWith('That') ? e.message : 'Could not read that playlist. Make sure it is public.'); b.disabled = false; b.textContent = 'Import'; }
+  $('#pastego').onclick = () => {
+    const v = $('#paste').value, rows = parseAny(v);
+    if (!rows.length && /open\.spotify\.com\/track\//.test(v)) { toast('Spotify copies song links, not names. Use screenshots or Exportify instead.'); return; }
+    if (addCrate('Pasted list', rows, 'paste')) renderSheet();
   };
-  $('#pgo').onclick = () => {
-    const rows = parseAny($('#paste').value);
-    if (addCrate($('#pname').value.trim() || 'Pasted list', rows, 'paste')) { libCrates(); renderRail(); }
+  wireArtistPicker($('#lq'), $('#ls'), $('#lchips'), picked => {
+    const go = $('#lgo'); go.hidden = !picked.size; go.textContent = `Add ${plural(picked.size, 'artist')}`;
+    go.onclick = () => {
+      let c = S.crates.find(c => c.src === 'picked');
+      if (!c) { c = { id: uid(), name: 'Artists I picked', src: 'picked', ts: Date.now(), tracks: [] }; S.crates.unshift(c); }
+      for (const a of picked.values()) if (!c.tracks.some(r => norm(r[1]) === norm(a.name))) c.tracks.push(['', a.name]);
+      save(true); tasteChanged(); toast(`Added ${plural(picked.size, 'artist')}.`); renderSheet();
+    };
+  });
+  $$('[data-delcrate]', b).forEach(x => x.onclick = () => {
+    const c = S.crates.find(c => c.id === x.dataset.delcrate); if (!c || !confirm(`Remove “${c.name}”? Its artists stop shaping your feed.`)) return;
+    S.crates = S.crates.filter(y => y !== c); S.ml.pos = S.ml.pos.filter(e => !(e.src === 'ref' && e.crate === c.id)); lrDirty = true;
+    save(true); tasteChanged(); renderSheet();
+  });
+  $('#dial').onchange = e => { S.dial = +e.target.value; save(); tasteChanged(); };
+  $('#forget').onclick = () => {
+    if (!confirm('Forget every like, skip and playlist sound the model learned? Your liked songs list stays.')) return;
+    S.ml = { pos: [], neg: [], st: null }; S.skipA = {}; S.crates.forEach(c => c.refTried = 0); lrDirty = true;
+    save(true); renderSheet(); toast('Reset. It relearns your playlists in the background.');
   };
-  $('#restorefile').onchange = async e => {
+  const dl = (name, text, type) => { const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([text], { type })); a.download = name; document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(a.href), 2000); };
+  $$('[data-export]', b).forEach(x => x.onclick = () => x.dataset.export === 'csv'
+    ? dl('liner-liked.csv', 'Track name,Artist name,Album\n' + S.likes.map(l => [l.t, l.a, l.al].map(v => `"${String(v).replace(/"/g, '""')}"`).join(',')).join('\n'), 'text/csv')
+    : dl('liner-liked.txt', S.likes.map(l => `${l.a} - ${l.t}`).join('\n'), 'text/plain'));
+  $$('[data-unlike]', b).forEach(x => x.onclick = () => { const id = +x.dataset.unlike; S.likes = S.likes.filter(l => l.id !== id); dropExample('pos', id, 'like'); save(); syncLikes(id); renderSheet(); });
+  $$('[data-playlike]', b).forEach(x => x.onclick = () => { const l = S.likes.find(l => l.id === +x.dataset.playlike); if (l) playNow(l); });
+  $('#bk').onclick = () => dl(`liner-backup-${new Date().toISOString().slice(0, 10)}.json`, JSON.stringify(S), 'application/json');
+  $('#rs').onclick = () => $('#rsin').click();
+  $('#rsin').onchange = async e => {
     try {
-      const d = JSON.parse(await e.target.files[0].text()); if (!d.me || !d.crates) throw 0;
-      Object.assign(S, defaults(), d); save(); resetDiscovery(); toast('Backup restored.'); renderShell(); route();
+      const d = JSON.parse(await e.target.files[0].text()); if (!Array.isArray(d.crates) || !Array.isArray(d.likes)) throw 0;
+      Object.assign(S, defaults(), d, { ml: { ...defaults().ml, ...(d.ml || {}) } }); lrDirty = true;
+      save(true); tasteChanged(); renderSheet(); toast('Backup restored.');
     } catch { toast('That file is not a Liner backup.'); }
   };
 }
-function crateHTML(c) {
-  const counts = new Map(); for (const [, a] of c.tracks) counts.set(a, (counts.get(a) || 0) + 1);
-  const top = [...counts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 5).map(x => x[0]);
-  return `<div class="crate"><div class="stack">${c.tracks.length > 999 ? fmtN(c.tracks.length) : c.tracks.length}</div>
-    <div style="min-width:0"><b>${esc(c.name)}</b><small>${plural(counts.size, 'artist')}: ${esc(top.join(', '))}</small></div>
-    <button class="btn sm" data-act="delcrate" data-id="${esc(c.id)}">Remove</button></div>`;
+async function runOCR(files) {
+  if (!files.length) return;
+  const out = $('#shotout'), btn = $('#shotbtn');
+  btn.disabled = true;
+  const set = (msg, frac) => { out.innerHTML = `<div class="progress">${esc(msg)}<div class="bar"><i style="width:${Math.round(frac * 100)}%"></i></div></div>`; };
+  let worker = null;
+  try {
+    set('Loading the text reader', .02);
+    await loadTesseract();
+    worker = await Tesseract.createWorker('eng');
+    const lines = [];
+    for (let i = 0; i < files.length; i++) {
+      set(`Reading screenshot ${i + 1} of ${files.length}`, .05 + .45 * i / files.length);
+      const { data } = await worker.recognize(await prepImage(files[i]));
+      for (const l of ocrLines(data.text || '')) if (lines[lines.length - 1] !== l) lines.push(l);
+    }
+    await worker.terminate(); worker = null;
+    const found = await matchOCR(lines.slice(0, 400), (i, n, f) => set(`Matching songs: ${plural(f, 'song')} found`, .5 + .5 * (n ? i / n : 1)));
+    if (!found.length) { out.innerHTML = '<div class="guide">No songs recognized. Use screenshots where song titles and artists are visible as text, and don’t crop them.</div>'; return; }
+    out.innerHTML = `<p class="small" style="margin:12px 0 0"><b>${plural(found.length, 'song')} found.</b> Uncheck any that are wrong.</p>
+      <div class="found">${found.map((t, i) => `<label><input type="checkbox" checked data-f="${i}"><span>${esc(t.t)}<small>${esc(t.a)}</small></span></label>`).join('')}</div>
+      <div class="row nw"><input type="text" id="shotname" placeholder="Name this playlist" aria-label="Playlist name"><button class="btn primary" id="shotadd">Add songs</button></div>`;
+    $('#shotadd').onclick = () => {
+      const rows = $$('[data-f]', out).filter(c => c.checked).map(c => found[+c.dataset.f]).map(t => [t.t, t.a]);
+      if (addCrate($('#shotname').value.trim() || 'From screenshots', rows, 'shots')) renderSheet();
+    };
+  } catch (e) {
+    out.innerHTML = `<div class="guide">${e.message === 'ocr' ? 'The text reader did not download. Check your connection and try again.' : 'Something went wrong reading those screenshots. Try fewer at a time.'}</div>`;
+  } finally {
+    if (worker) worker.terminate().catch(() => { });
+    btn.disabled = false; const inp = $('#shotin'); if (inp) inp.value = '';
+  }
 }
-function libFinds() {
-  const b = $('#lbody');
-  if (!S.finds.length) { b.innerHTML = `<div class="empty"><h2>Nothing saved yet</h2><p>Tap the heart on anything in your feed. Finds feed back into your taste, and you can export them to rebuild a playlist anywhere.</p><a class="btn" href="#/home">Back to your feed</a></div>`; return; }
-  CTX.finds = () => S.finds;
-  b.innerHTML = `<div class="section row"><span class="muted small" style="margin-right:auto">${plural(S.finds.length, 'track')} saved</span><button class="btn sm" data-act="exportfinds" data-fmt="csv">Export CSV</button><button class="btn sm" data-act="exportfinds" data-fmt="txt">Export text</button></div>
-    ${S.finds.map(f => trackHTML(f, 'finds', { sub: f.via ? `Near ${f.via}` : f.al })).join('')}`;
+function playNow(l) {
+  sheet.close();
+  const item = { tr: { id: l.id, t: l.t, a: l.a, ai: l.ai, al: l.al, c: l.c }, via: null, label: 'From your likes', g: 0 };
+  if (!started) { unlockAudio(); started = true; startEl.hidden = true; }
+  const at = Math.min(cur + 1, SL.length);
+  makeSlide(item, Math.max(0, at));
+  activate(Math.max(0, at)); snapTo(Math.max(0, at));
 }
-
-/* ---------- people ---------- */
-function vPeople() {
-  view.innerHTML = `${head('People')}
-    <div class="section">
-      <h2>Follow someone</h2>
-      <p class="muted small">Liner has no accounts or servers. People share their profile as a link; open it or paste it here to follow them. When they post new finds, ask for a fresh link.</p>
-      <div class="row" style="flex-wrap:nowrap"><input type="url" id="plink" placeholder="Paste a Liner profile link"><button class="btn primary" id="pgo">Open</button></div>
-      <div class="row" style="margin-top:12px"><button class="btn" data-act="sharelink">Copy my profile link</button></div>
-    </div>
-    <div id="plist">${S.following.length ? S.following.map(personRow).join('') : '<div class="empty"><h2>You aren\'t following anyone yet</h2><p>Copy your profile link and send it to a friend who has good taste. Ask them for theirs.</p></div>'}</div>`;
-  $('#pgo').onclick = () => {
-    const v = $('#plink').value.trim(); const m = /#\/u\/([\w-]+)/.exec(v);
-    if (!m) { toast('That is not a Liner profile link.'); return; }
-    location.hash = '#/u/' + m[1];
-  };
-}
-function personRow(f) {
-  const m = matchWith(f.a);
-  return `<div class="post" style="align-items:center">${avatar(f)}<div class="row" style="justify-content:space-between">
-    <div style="min-width:0"><a href="#/p/${esc(f.k)}" style="text-decoration:none"><b>@${esc(f.h)}</b></a><div class="small muted">${m.pct}% taste match, ${plural(f.p.length, 'post')}, updated ${ago(f.updated)}</div></div>
-    <div class="row"><button class="btn sm${f.blend ? ' blue' : ''}" data-act="blend" data-k="${esc(f.k)}" aria-pressed="${!!f.blend}">${f.blend ? 'Blended into feed' : 'Blend into feed'}</button><button class="btn sm" data-act="unfollow" data-k="${esc(f.k)}">Unfollow</button></div></div></div>`;
-}
-
-/* ---------- profiles ---------- */
-function profileHTML(pr, self, focusId) {
-  const m = self ? null : matchWith(pr.a);
-  const sharedSet = new Set((m?.shared || []).map(norm));
-  const ctx = self ? 'mine' : 'theirs';
-  const au = self ? meAuthor() : pr;
-  CTX[ctx] = () => pr.p.map(p => p.tr);
-  const fol = !self && followed(pr.k);
-  return `<div class="band" style="--h:${pr.c | 0}"></div>
-    <div class="phead"><div class="top">${avatar(au, true)}<div class="row">
-      ${self ? `<button class="btn" data-act="editprofile">Edit profile</button><button class="btn primary" data-act="sharelink">Copy profile link</button>`
-      : `<button class="btn ${fol ? '' : 'primary'}" data-act="${fol ? 'unfollow' : 'follow'}" data-k="${esc(pr.k)}">${fol ? 'Following' : 'Follow'}</button>`}</div></div>
-      <h2>@${esc(pr.h)}</h2>
-      ${pr.b ? `<p class="bio">${esc(pr.b)}</p>` : self ? '<p class="bio muted">Add a bio so friends know what you dig.</p>' : ''}
-      <div class="stats"><span><b>${pr.a.length >= 30 ? '30+' : pr.a.length}</b> artists in taste</span><span><b>${pr.p.length}</b> posts</span>${self ? `<span><b>${S.finds.length}</b> finds</span><span><b>${S.crates.length}</b> crates</span>` : ''}${pr.s ? `<span>Digging since ${new Date(pr.s).toLocaleDateString(undefined, { month: 'short', year: 'numeric' })}</span>` : ''}</div>
-      ${m ? `<div class="match"><strong>${m.pct}%</strong>taste match${m.shared.length ? `. You both have ${esc(m.shared.slice(0, 4).join(', '))}${m.shared.length > 4 ? ` and ${m.shared.length - 4} more` : ''}.` : '. No artists in common yet, so their finds are all new to you.'}</div>` : ''}
-    </div>
-    ${pr.a.length ? `<div class="section"><h2>${self ? 'Your taste' : 'Their taste'}</h2><div class="chips">${pr.a.map(([id, n]) => `<a class="chip${sharedSet.has(norm(n)) ? ' shared' : ''}" ${id ? `href="#/artist/${id}"` : `href="#/explore/${encodeURIComponent(n)}"`}>${esc(n)}</a>`).join('')}</div></div>` : ''}
-    <div class="section" style="border:0;padding-bottom:0"><h2>Posts</h2></div>
-    ${pr.p.length ? pr.p.map(p => postHTML(p, au, ctx, p.id === focusId)).join('') : `<p class="section muted" style="border:0">${self ? 'Share a find and it shows up here.' : 'No posts in this link yet.'}</p>`}`;
-}
-function vMe() {
-  const pr = { k: S.me.key, h: S.me.handle, b: S.me.bio, c: S.me.hue, s: S.me.since, a: topArtists(30).map(e => [e.id, e.name]), p: S.posts };
-  view.innerHTML = head('Profile') + profileHTML(pr, true);
-}
-function vPerson(k) {
-  const f = followed(k);
-  if (!f && incoming && incoming.k === k) { view.innerHTML = head('@' + incoming.h, '#/people') + profileHTML(incoming, false); return; }
-  if (!f) { view.innerHTML = head('Profile', '#/people') + `<div class="empty"><h2>Not following this person</h2><p>Open their profile link to see their profile.</p></div>`; return; }
-  view.innerHTML = head('@' + f.h, '#/people') + profileHTML(f, false);
-}
-async function vIncoming(data) {
-  view.innerHTML = head('Profile', '#/people') + loading('Opening profile link');
-  try { incoming = await unpackProfile(data); }
-  catch { view.innerHTML = head('Profile', '#/people') + `<div class="empty"><h2>This link is broken</h2><p>The profile link was cut off or changed. Ask for a fresh one.</p></div>`; return; }
-  if (incoming.k === S.me.key) { view.innerHTML = head('Your profile link', '#/me') + `<div class="section"><p>This is your own profile link. Anyone who opens it can follow you and see your posts as they were when you copied it.</p></div>` + profileHTML({ ...incoming }, true); return; }
-  const f = followed(incoming.k);
-  if (f) { Object.assign(f, incoming); save(); toast(`Updated @${incoming.h} with their latest posts.`); renderRail(); }
-  view.innerHTML = head('@' + incoming.h, '#/people') + profileHTML(f || incoming, false);
-}
-
-/* ---------- rail ---------- */
-function renderRail() {
-  const rail = $('#rail');
-  const top = topArtists(14);
-  const sugg = [...new Set([132, 116, 152, 113, 129, 106, 85])].filter(id => !S.channels.includes(id)).slice(0, 4);
-  rail.innerHTML = `
-    <div class="box"><h2>Your taste</h2>${top.length ? `<div class="chips">${top.map(e => `<a class="chip" href="${e.id ? '#/artist/' + e.id : '#/explore/' + encodeURIComponent(e.name)}">${esc(e.name)}</a>`).join('')}</div>
-      <p class="small muted" style="margin:10px 0 0">From ${plural(S.crates.length, 'crate')} and ${plural(S.finds.length, 'find')}.</p>` : '<p class="small muted" style="margin:0">Import a playlist and your top artists show up here.</p><a class="btn sm" href="#/library" style="margin-top:10px">Import a playlist</a>'}</div>
-    <div class="box"><h2>People</h2>${S.following.length ? S.following.slice(0, 5).map(f => `<a class="person" href="#/p/${esc(f.k)}">${avatar(f).replace(/<a /, '<span ').replace(/<\/a>$/, '</span>')}<div><b>@${esc(f.h)}</b><small>${matchWith(f.a).pct}% match</small></div></a>`).join('')
-      : '<p class="small muted" style="margin:0 0 10px">Friends follow each other by swapping profile links.</p>'}<button class="btn sm" data-act="sharelink" style="margin-top:6px">Copy my profile link</button></div>
-    <div class="box" id="railch"><h2>Channels</h2><p class="small muted" style="margin:0">Loading</p></div>
-    <p class="foot">Catalog, artwork and 30-second previews from the <a href="https://developers.deezer.com" target="_blank" rel="noopener">Deezer API</a>. Your data stays in this browser.</p>`;
-  api.genres().then(gs => {
-    const box = $('#railch'); if (!box) return;
-    const show = gs.filter(g => S.channels.includes(g.id) || sugg.includes(g.id)).slice(0, 6);
-    box.innerHTML = '<h2>Channels</h2>' + show.map(g => { const on = S.channels.includes(g.id); return `<div class="person"><a href="#/genre/${g.id}" style="text-decoration:none"><b>${esc(g.name)}</b></a><button class="btn sm ${on ? '' : 'primary'}" data-act="chan" data-id="${g.id}">${on ? 'Following' : 'Follow'}</button></div>`; }).join('');
-  }).catch(() => { const b = $('#railch'); if (b) b.remove(); });
-}
-function renderShell() {
-  $('#mecard').innerHTML = `<span class="av" style="--h:${S.me.hue}">${esc(S.me.handle[0])}</span><div><b>@${esc(S.me.handle)}</b><small>${plural(S.posts.length, 'post')}</small></div>`;
-}
-
-/* ================= actions ================= */
-function download(name, text, type) {
-  const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([text], { type })); a.download = name; a.click();
-  setTimeout(() => URL.revokeObjectURL(a.href), 2000);
-}
-const ACT = {
-  play: b => play(+b.dataset.id, b.dataset.ctx),
-  save: b => toggleFind(+b.dataset.id, b.dataset.via),
-  compose: b => compose(b.dataset.id ? +b.dataset.id : null),
-  repost: b => compose(+b.dataset.id, '', { h: b.dataset.from }),
-  close: () => modal.close(),
-  htab: b => { homeTab = b.dataset.tab; route(); },
-  ltab: b => { libTab = b.dataset.tab; route(); },
-  nope: b => {
-    S.nope[b.dataset.artist] = 1; save();
-    const card = b.closest('.sleeve'); const id = +card.dataset.card;
-    D.cards = D.cards.filter(c => c.tr.id !== id); card.remove();
-    if (P.cur?.id === id) next();
-    toast(`You won't see ${b.dataset.name} again.`);
-    renderMoreCards();
-  },
-  endtrail: () => { S.trail = null; save(); resetDiscovery(); route(); },
-  trail: b => { S.trail = { id: +b.dataset.id, name: b.dataset.name }; save(); resetDiscovery(); homeTab = 'foryou'; location.hash = '#/home'; },
-  addtaste: b => {
-    let c = S.crates.find(c => c.src === 'picked');
-    if (!c) { c = { id: uid(), name: 'Artists I picked', src: 'picked', ts: Date.now(), tracks: [] }; S.crates.unshift(c); }
-    c.tracks.push(['', b.dataset.name]); save(); resetDiscovery(); toast(`Added ${b.dataset.name} to your taste.`); b.remove(); renderRail();
-  },
-  chan: b => {
-    const id = +b.dataset.id, i = S.channels.indexOf(id);
-    i >= 0 ? S.channels.splice(i, 1) : S.channels.push(id); save();
-    toast(i >= 0 ? 'Unfollowed channel.' : 'Following. Its daily picks show up in Home, under Following.');
-    if (curRoute === 'genre') route(); else renderRail();
-  },
-  delcrate: b => {
-    const c = S.crates.find(c => c.id === b.dataset.id); if (!c || !confirm(`Remove “${c.name}”? Its artists stop shaping your feed.`)) return;
-    S.crates = S.crates.filter(x => x !== c); save(); resetDiscovery(); libCrates(); renderRail();
-  },
-  delpost: b => { if (!confirm('Delete this post?')) return; S.posts = S.posts.filter(p => p.id !== b.dataset.post); save(); renderShell(); route(); },
-  editprofile: editProfile,
-  sharelink: copyProfileLink,
-  follow: b => {
-    if (!incoming || incoming.k !== b.dataset.k) return;
-    S.following.unshift({ ...incoming, blend: false }); save();
-    toast(`Following @${incoming.h}. Their posts show up in Home, under Following.`); location.hash = '#/p/' + incoming.k;
-  },
-  unfollow: b => {
-    const f = followed(b.dataset.k); if (!f || !confirm(`Unfollow @${f.h}?`)) return;
-    incoming = incoming && incoming.k === f.k ? incoming : { ...f };
-    S.following = S.following.filter(x => x !== f); save(); resetDiscovery(); route();
-  },
-  blend: b => {
-    const f = followed(b.dataset.k); if (!f) return; f.blend = !f.blend; save(); resetDiscovery();
-    toast(f.blend ? `Your For you feed now also digs from @${f.h}'s artists.` : `Stopped blending @${f.h}.`); route();
-  },
-  exportfinds: b => {
-    if (b.dataset.fmt === 'csv') download('liner-finds.csv', 'Track name,Artist name,Album\n' + S.finds.map(f => [f.t, f.a, f.al].map(v => `"${String(v).replace(/"/g, '""')}"`).join(',')).join('\n'), 'text/csv');
-    else download('liner-finds.txt', S.finds.map(f => `${f.a} - ${f.t}`).join('\n'), 'text/plain');
-  },
-  backup: () => download(`liner-backup-${new Date().toISOString().slice(0, 10)}.json`, JSON.stringify(S), 'application/json'),
-  restore: () => $('#restorefile').click(),
-};
-document.addEventListener('click', e => {
-  const b = e.target.closest('[data-act]'); if (!b) return;
-  const fn = ACT[b.dataset.act]; if (!fn) return;
-  e.preventDefault(); fn(b);
-});
 
 /* ================= boot ================= */
-addEventListener('hashchange', route);
-addEventListener('storage', e => { if (e.key === KEY) location.reload(); });
-renderShell(); route();
+renderStart();
+updateLoader();
+if (hasTaste()) fill();
