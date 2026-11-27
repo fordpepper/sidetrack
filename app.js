@@ -23,7 +23,7 @@ const plural = (n, w, p) => `${n.toLocaleString()} ${n === 1 ? w : (p || w + 's'
 const debounce = (fn, ms) => { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; };
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const clamp = (x, a, b) => Math.max(a, Math.min(b, x));
-function dice(a, b) { // bigram similarity, tolerant of OCR slips
+function dice(a, b) { // bigram similarity, tolerant of small spelling differences
   if (!a || !b) return 0; if (a === b) return 1; if (a.length < 2 || b.length < 2) return 0;
   const bg = s => { const m = new Map(); for (let i = 0; i < s.length - 1; i++) { const g = s.slice(i, i + 2); m.set(g, (m.get(g) || 0) + 1); } return m; };
   const A = bg(a), B = bg(b); let n = 0; for (const [g, c] of A) n += Math.min(c, B.get(g) || 0);
@@ -43,7 +43,6 @@ const I = {
   play: '<svg viewBox="0 0 24 24"><path d="M7 4.5v15l12.5-7.5z"/></svg>',
   heart: '<svg viewBox="0 0 24 24"><path d="M12 20.5s-8-4.9-8-11A4.5 4.5 0 0 1 12 6.6a4.5 4.5 0 0 1 8 2.9c0 6.1-8 11-8 11z"/></svg>',
   x: '<svg viewBox="0 0 24 24"><path d="m6 6 12 12M18 6 6 18"/></svg>',
-  shot: '<svg viewBox="0 0 24 24"><rect x="6" y="2.5" width="12" height="19" rx="2.5"/><path d="M9.5 7h5M9.5 10.5h5M9.5 14h3"/></svg>',
   file: '<svg viewBox="0 0 24 24"><path d="M6 3h8l4 4v14H6zM14 3v4h4M9 13h6M9 17h6"/></svg>',
 };
 
@@ -133,7 +132,7 @@ async function dzc(path, params, ttl, map) {
   const hit = cget(k); if (hit !== undefined) return hit;
   const v = map(await dz(path, params)); cset(k, v, ttl); return v;
 }
-const mapTrack = t => ({ id: t.id, t: t.title_short || t.title || '', a: t.artist?.name || '', ai: t.artist?.id || 0, al: t.album?.title || '', c: t.album?.md5_image || t.md5_image || mdOf(t.album?.cover_medium) });
+const mapTrack = t => ({ id: t.id, t: t.title_short || t.title || '', a: t.artist?.name || '', ai: t.artist?.id || 0, al: t.album?.title || '', c: t.album?.md5_image || t.md5_image || mdOf(t.album?.cover_medium), r: t.rank || 0 });
 const mapArtist = a => ({ id: a.id, name: a.name, fans: a.nb_fan || 0, p: a.md5_image || mdOf(a.picture_medium) });
 const api = {
   searchArtist: q => dzc('search/artist', { q, limit: 6 }, 168, d => (d.data || []).map(mapArtist)),
@@ -378,14 +377,44 @@ function tasteMap() {
   return m;
 }
 const hasTaste = () => S.crates.some(c => c.tracks.length) || S.likes.length > 0;
-function seedList() { return [...tasteMap().values()].map(e => ({ ...e, w: Math.log2(1 + e.w) })).sort((a, b) => b.w - a.w).slice(0, 90); }
-const G = { gen: 0, pool: new Map(), used: new Set(), knownIds: new Set(), shownA: new Set(), cands: [], busy: null, exhausted: false, err: false };
-function resetGraph() { G.gen++; G.pool.clear(); G.used.clear(); G.cands = []; G.exhausted = false; G.err = false; G.busy = null; }
-function dialFactor(fans) {
-  const pop = clamp((Math.log10(fans + 1) - 3) / 3.6, 0, 1), d = S.dial; // 1k fans -> 0, 4M -> 1
-  return d < .5 ? 1 + (.5 - d) * 2.4 * (pop - .4) : 1 + (d - .5) * 2.8 * (.6 - pop);
+/* Without a playlist the feed starts from what's charting on Deezer (overall plus a few random
+   genres) and leans toward your likes as they come in. */
+let COLD = null;
+const coldMode = () => !S.crates.some(c => c.tracks.length) && S.likes.length < 8;
+async function loadCold() {
+  if (COLD) return COLD;
+  // the overall track chart plus genre charts for a random handful of music genres
+  // (Deezer's artist chart mixes in audiobooks and kids' radio plays, so it isn't used)
+  const MUSIC = [132, 116, 152, 113, 165, 85, 106, 466, 144, 129, 464, 169, 2, 16, 153, 75, 197];
+  const pick = MUSIC.map(g => [g, Math.random()]).sort((a, b) => a[1] - b[1]).slice(0, 6).map(x => x[0]);
+  const artistsOf = d => ((d && d.data) || []).map(t => t.artist).filter(Boolean).map(mapArtist);
+  const lists = await Promise.all([
+    dzc('chart/0/tracks', { limit: 60 }, 12, artistsOf).then(l => l.map(a => [a, 'chart', 1])),
+    ...pick.map(g => dzc(`editorial/${g}/charts`, { limit: 20 }, 12, d => artistsOf(d && d.tracks)).then(l => l.map(a => [a, 'g' + g, .6])).catch(() => [])),
+  ]);
+  const m = new Map(); for (const l of lists) for (const [a, grp, w] of l) if (!isKids(a.name) && !m.has(a.id)) m.set(a.id, { name: a.name, n: norm(a.name), id: a.id, w, grp, cold: true });
+  if (!m.size) throw new Error('chart');
+  COLD = [...m.values()];
+  return COLD;
 }
-function wsample(items, k) { return items.map(it => ({ it, key: Math.pow(Math.random(), 1 / Math.max(.01, it.w)) })).sort((a, b) => b.key - a.key).slice(0, k).map(x => x.it); }
+function seedList() {
+  const own = [...tasteMap().values()].map(e => ({ ...e, w: Math.log2(1 + e.w) }));
+  if (coldMode() && COLD) { const have = new Set(own.map(s => s.n)); for (const c of COLD) if (!have.has(c.n)) own.push({ ...c }); }
+  return own.sort((a, b) => b.w - a.w).slice(0, 90);
+}
+const G = { viaUse: new Map(), gen: 0, pool: new Map(), used: new Set(), knownIds: new Set(), shownA: new Set(), cands: [], busy: null, exhausted: false, err: false };
+function resetGraph() { G.gen++; G.pool.clear(); G.used.clear(); G.cands = []; G.exhausted = false; G.err = false; G.busy = null; }
+const popOf = fans => clamp((Math.log10(fans + 1) - 3) / 3.5, 0, 1); // 1k fans -> 0, about 3M -> 1
+// The dial's middle already favours well-known artists; the far right flips to obscure ones.
+function dialFactor(fans) { return Math.pow(.1 + popOf(fans), 4 * (.75 - S.dial)); }
+const minFans = () => S.dial <= .5 ? (coldMode() ? 150000 : 30000) : S.dial <= .7 ? 3000 : 0;
+function wsample(items, k) {
+  const keyed = items.map(it => ({ it, key: Math.pow(Math.random(), 1 / Math.max(.01, it.w)) })).sort((a, b) => b.key - a.key);
+  const out = [], grps = new Set();
+  for (const { it } of keyed) { const g = it.grp || it.n; if (!grps.has(g)) { grps.add(g); out.push(it); if (out.length >= k) return out; } }
+  for (const { it } of keyed) { if (!out.includes(it)) { out.push(it); if (out.length >= k) break; } }
+  return out;
+}
 async function feedSeed(s, gen) {
   G.used.add(s.n);
   let id = s.id;
@@ -394,39 +423,59 @@ async function feedSeed(s, gen) {
   let rel; try { rel = await api.related(id); } catch { G.used.delete(s.n); return 'err'; }
   if (gen !== G.gen) return 'stale';
   rel.forEach((r, i) => {
-    const c = G.pool.get(r.id) || { a: r, score: 0, via: new Map() };
+    const c = G.pool.get(r.id) || { a: r, score: 0, coldScore: 0, via: new Map() };
     const add = s.w * (1 - i / 36); c.score += add; c.via.set(s.name, (c.via.get(s.name) || 0) + add);
+    if (s.cold) c.coldScore += add;
     G.pool.set(r.id, c);
   });
   return 'ok';
 }
 const isLiked = id => S.likes.some(l => l.id === id);
+const SPOKEN = /\b(folge|teil|kapitel|chapter|episode|h\u00f6rspiel|h\u00f6rbuch|audiobook|audio book|podcast|t\u00fcr)\b\s*\d*|^\d+\s*[-\u2013.:]\s/i;
+const isSpoken = t => SPOKEN.test(t.t) || SPOKEN.test(t.al || '') || isKids(t.al || '');
+const KIDS = /kinder|\bkids\b|\bdisney\b|children|lullab|wiegenlied|schlaflied|nursery|bibi blocksberg|bibi und tina|benjamin bl\u00fcmchen|schl\u00fcmpfe|spongebob|baby ?shark|h\u00f6rspiel|h\u00f6rbuch/i;
+function isKids(name) { return KIDS.test(name || ''); }
+// holiday songs only during the holidays
+const XMAS = /christmas|xmas|weihnacht|navidad|no\u00ebl|jingle|santa|let it snow|winter wonderland|mistletoe|sleigh|rudolph|silent night|feliz navidad/i;
+const holidays = () => { const d = new Date(); return d.getMonth() === 11 && d.getDate() <= 26; };
+const offSeason = t => !holidays() && (XMAS.test(t.t) || XMAS.test(t.al || ''));
 function digMore(n = 6) {
   if (G.busy) return G.busy;
   const gen = G.gen;
   const run = (async () => {
     let added = 0, errs = 0, oks = 0;
+    if (coldMode()) await loadCold().catch(() => { errs++; });
+    if (gen !== G.gen) return 0;
     const known = new Set(tasteMap().keys());
     for (let round = 0; round < 3 && added < n && !offline(); round++) {
       const avail = seedList().filter(s => !G.used.has(s.n));
       const fresh = [...G.pool.values()].filter(c => !G.shownA.has(c.a.id)).length;
-      if (avail.length && (fresh < n * 3 || round > 0)) {
-        const r = await Promise.all(wsample(avail, round ? 6 : 5).map(s => feedSeed(s, gen)));
+      if (avail.length && (round === 0 || fresh < n * 4)) {
+        const r = await Promise.all(wsample(avail, round ? 5 : 3).map(s => feedSeed(s, gen)));
         errs += r.filter(x => x === 'err').length; oks += r.filter(x => x === 'ok').length;
       }
       if (gen !== G.gen) return 0;
+      // Score: strongest link plus a damped share of the others, so one dense cluster can't take
+      // over; at most two picks per batch may hang off the same artist of yours.
+      const perVia = new Map();
       const cand = [...G.pool.values()]
-        .filter(c => !G.shownA.has(c.a.id) && !G.knownIds.has(c.a.id) && !known.has(norm(c.a.name)))
-        .map(c => ({ c, s: c.score * Math.max(.05, dialFactor(c.a.fans)) * Math.pow(.45, S.skipA[c.a.id] || 0) * (.85 + Math.random() * .3) }))
-        .sort((x, y) => y.s - x.s).slice(0, n - added);
+        .filter(c => !G.shownA.has(c.a.id) && !G.knownIds.has(c.a.id) && !known.has(norm(c.a.name)) && c.a.fans >= minFans())
+        .map(c => { const vs = [...c.via.values()], mx = Math.max(...vs), sum = vs.reduce((a, b) => a + b, 0);
+          const top = [...c.via.entries()].sort((a, b) => b[1] - a[1])[0][0];
+          return { c, s: (mx + .35 * (sum - mx)) * dialFactor(c.a.fans) * Math.pow(.45, S.skipA[c.a.id] || 0) * Math.pow(.7, G.viaUse.get(top) || 0) * (.8 + Math.random() * .4) }; })
+        .sort((x, y) => y.s - x.s)
+        .filter(({ c }) => { const top = [...c.via.entries()].sort((a, b) => b[1] - a[1])[0][0]; const k = perVia.get(top) || 0; if (k >= 2) return false; perVia.set(top, k + 1); return true; })
+        .slice(0, n - added);
       if (!cand.length && !avail.length) { G.exhausted = true; break; }
       const got = await Promise.all(cand.map(async ({ c, s }) => {
         G.shownA.add(c.a.id);
         let tops; try { tops = await api.top(c.a.id); } catch { errs++; G.shownA.delete(c.a.id); return null; }
         oks++;
-        const pick = tops.filter(t => t.ai === c.a.id && !S.seen[t.id] && !isLiked(t.id)).slice(0, 6);
-        const t = pick[Math.random() * Math.min(3, pick.length) | 0];
-        return t ? { tr: t, artist: c.a, via: [...c.via.entries()].sort((a, b) => b[1] - a[1]).map(v => v[0]), g: s } : null;
+        // the artist's best-known songs first (Deezer orders top tracks by popularity)
+        if (isKids(c.a.name) || tops.slice(0, 5).filter(isSpoken).length >= 2) return null; // spoken word or kids
+        const pick = tops.filter(t => t.ai === c.a.id && !S.seen[t.id] && !isLiked(t.id) && !isSpoken(t) && !offSeason(t)).slice(0, 4);
+        const t = pick[Math.random() < .7 ? 0 : Math.random() * Math.min(3, pick.length) | 0];
+        return t ? { tr: t, artist: c.a, via: [...c.via.entries()].sort((a, b) => b[1] - a[1]).map(v => v[0]), g: s, cold: c.coldScore >= c.score - 1e-9 } : null;
       }));
       if (gen !== G.gen) return 0;
       for (const x of got) if (x) { G.cands.push(x); added++; }
@@ -480,15 +529,24 @@ function choose() {
   if (!R.length) return null;
   const gmax = Math.max(...R.map(c => c.g)) || 1;
   const nEx = S.ml.pos.length + S.ml.neg.length;
-  const wa = S.ml.pos.length ? Math.min(.55, .15 + nEx / 80) : 0;
-  const explore = Math.random() < .12; // keep some surprise so the feed doesn't narrow too fast
+  const wa = S.ml.pos.length ? Math.min(.35, .1 + nEx / 100) : 0, wn = .25;
+  // variety: compare each candidate with the last few songs placed in the feed
+  const recent = SL.slice(-4).map(s => s.item);
+  const recentZ = recent.filter(i => i.feat).map(i => zs(i.feat));
+  const viaCount = new Map(); for (const s of SL.slice(-8)) { const v = s.item.via && s.item.via[0]; if (v) viaCount.set(v, (viaCount.get(v) || 0) + 1); }
+  const explore = Math.random() < .1; // keep some surprise
   let best = null, bs = -Infinity;
   for (const c of R) {
     const as = audioScore(c.feat);
-    const s = explore ? Math.random() : (1 - wa) * (c.g / gmax) + wa * (as ?? .5);
+    let nov = .5;
+    if (c.feat && recentZ.length) { const z = zs(c.feat); nov = (1 - Math.max(...recentZ.map(r => cos(z, r)))) / 2; }
+    let s = (1 - wa - wn) * (c.g / gmax) + wa * (as ?? .5) + wn * nov;
+    if (c.via) s *= Math.pow(.55, viaCount.get(c.via[0]) || 0);
+    if (explore) s = Math.random();
     if (s > bs) { bs = s; best = c; }
   }
   R.splice(R.indexOf(best), 1);
+  if (best.via && best.via[0]) G.viaUse.set(best.via[0], (G.viaUse.get(best.via[0]) || 0) + 1);
   return best;
 }
 function flushReady() { R.splice(0).forEach(unrealize); }
@@ -509,7 +567,7 @@ function slideHTML(item) {
     <div class="meta">
       <h2>${esc(t.t)}</h2>
       <p class="artist">${esc(t.a)}</p>
-      ${via.length ? `<p class="why">Near <b>${via.map(esc).join('</b> and <b>')}</b>${more > 0 ? ` and ${more} more of yours` : ''}</p>` : item.label ? `<p class="why">${esc(item.label)}</p>` : ''}
+      ${via.length ? `<p class="why">Near <b>${via.map(esc).join('</b> and <b>')}</b>${item.cold ? ', popular right now' : more > 0 ? ` and ${more} more of yours` : ''}</p>` : item.label ? `<p class="why">${esc(item.label)}</p>` : ''}
       <div class="acts">
         <button class="like" aria-pressed="${liked}">${I.heart}<span>${liked ? 'Liked' : 'Like'}</span></button>
         <button class="full" aria-expanded="false">Full song</button>
@@ -550,14 +608,13 @@ function ensureAhead(noFill) {
   const ahead = started ? 2 : 1;
   while (R.length && SL.length - 1 - Math.max(cur, 0) < ahead) makeSlide(choose());
   if (started) { const nx = SL[cur + 1]; if (nx) realize(nx.item).catch(() => { }); } // next song ready to play instantly
-  if (!noFill && hasTaste() && R.length < readyTarget() && (G.cands.length || (!G.exhausted && !G.err))) fill();
+  if (!noFill && R.length < readyTarget() && (G.cands.length || (!G.exhausted && !G.err))) fill();
   updateLoader();
 }
 function updateLoader() {
   const msg = $('#lmsg'), retry = $('#lretry');
   let t, idle = true; retry.hidden = true;
-  if (!hasTaste()) t = 'Add some music in Library to start your feed.';
-  else if (G.err) { t = "Can't reach Deezer right now. Check your connection."; retry.hidden = false; }
+  if (G.err) { t = "Can't reach Deezer right now. Check your connection."; retry.hidden = false; }
   else if (G.exhausted && !R.length && !G.cands.length && !filling) t = "That's every artist near your music for now. Add another playlist or like a few more songs to open new paths.";
   else { t = 'Finding the next song'; idle = false; }
   msg.textContent = t; loaderEl.classList.toggle('idle', idle);
@@ -802,7 +859,8 @@ $('#auto').setAttribute('aria-checked', S.auto);
 
 /* ================= import: parsing ================= */
 const cleanArtist = s => String(s || '').replace(/\s+(feat\.?|ft\.?|featuring|with)\s+.*$/i, '').replace(/\s+/g, ' ').trim();
-const cleanTitle = s => String(s || '').replace(/\.(mp3|flac|m4a|ogg|wav|opus|aac)$/i, '').replace(/^\s*\d{1,3}[\s.\-_)]+(?=\D)/, '').trim();
+const cleanTitle = s => String(s || '').replace(/\.(mp3|flac|m4a|ogg|wav|opus|aac)$/i, '').replace(/^\s*\d{1,3}[\s.\-_)]+(?=\D)/, '')
+  .replace(/\s+-\s+(\d{4}\s+)?(remaster(ed)?|live|mono|stereo|radio edit|single version|edit|bonus track)\b.*$/i, '').trim();
 function splitArtists(s) { s = String(s || ''); return (s.includes(';') ? s.split(';') : s.split(/,\s*/)).map(cleanArtist).filter(Boolean); }
 function trackRow(title, artistStr) { const as = splitArtists(artistStr); if (!as.length) return null; return as.length > 1 ? [cleanTitle(title), as[0], as.slice(1, 4)] : [cleanTitle(title), as[0]]; }
 function parseCSV(txt) {
@@ -851,19 +909,20 @@ function parseXSPF(txt) {
   const doc = new DOMParser().parseFromString(txt, 'application/xml');
   return [...doc.getElementsByTagName('track')].map(t => trackRow(t.getElementsByTagName('title')[0]?.textContent, t.getElementsByTagName('creator')[0]?.textContent)).filter(Boolean);
 }
-function parseJSON(txt) {
+function parseJSON(txt) { return parseJSONObj(JSON.parse(txt)); }
+function parseJSONObj(root) {
   const out = [], seen = new WeakSet();
   const walk = o => {
     if (!o || typeof o !== 'object' || seen.has(o) || out.length > 20000) return; seen.add(o);
     if (!Array.isArray(o)) {
-      const ak = Object.keys(o).find(k => /^(artistname|artist|artist_name|creator|artists|master_metadata_album_artist_name)$/i.test(k));
+      const ak = Object.keys(o).find(k => /^(artistname|artist|artist_name|creator|artists|byartist|master_metadata_album_artist_name)$/i.test(k));
       const tk = Object.keys(o).find(k => /^(trackname|track_name|title|track|name|song|master_metadata_track_name)$/i.test(k));
       let av = ak && o[ak]; if (Array.isArray(av)) av = av.map(x => typeof x === 'string' ? x : x?.name).filter(Boolean).join(';'); else if (av && typeof av === 'object') av = av.name;
       if (typeof av === 'string' && av && (!tk || typeof o[tk] === 'string')) { const r = trackRow(tk ? o[tk] : '', av); if (r) { out.push(r); return; } }
     }
     for (const v of Object.values(o)) walk(v);
   };
-  walk(JSON.parse(txt));
+  walk(root);
   return out;
 }
 function parseAny(txt, name = '') {
@@ -888,14 +947,141 @@ async function importDeezer(url) {
   }
   return { name: info.title || 'Deezer ' + kind, rows };
 }
-function linkKind(v) {
-  if (/deezer\.page\.link|link\.deezer\.com/i.test(v)) return 'deezer-short';
-  if (/deezer\.com/i.test(v)) return 'deezer';
-  if (/spotify\.com|spotify:/i.test(v)) return 'spotify';
-  if (/music\.apple\.com|itunes\.apple\.com/i.test(v)) return 'apple';
-  if (/youtube\.com|youtu\.be/i.test(v)) return 'youtube';
-  if (/soundcloud\.com|tidal\.com|amazon\.|qobuz\.com|pandora\.com/i.test(v)) return 'other';
-  return '';
+/* ---- playlist links from any site ----
+   Streaming sites don't let other websites read their pages, so pages are fetched through
+   r.jina.ai (a free page reader that allows it), with api.microlink.io as a backup. */
+async function fetchPage(url, fmt) {
+  const withTimeout = async (p, ms) => { const ctl = new AbortController(), t = setTimeout(() => ctl.abort(), ms); try { return await p(ctl.signal); } finally { clearTimeout(t); } };
+  try {
+    return await withTimeout(async signal => {
+      const r = await fetch('https://r.jina.ai/' + url, { signal, headers: fmt === 'html' ? { 'X-Return-Format': 'html' } : {} });
+      if (!r.ok) throw new Error('reader ' + r.status);
+      const t = await r.text(); if (t.length < 200) throw new Error('empty'); return t;
+    }, 60000);
+  } catch {
+    return withTimeout(async signal => {
+      const r = await fetch('https://api.microlink.io/?' + new URLSearchParams({ url, 'data.html.selector': 'html', 'data.html.attr': 'html', meta: 'false' }), { signal });
+      const j = await r.json(); if (j.status !== 'success' || !j.data || !j.data.html) throw new Error('fetch');
+      return fmt === 'html' ? j.data.html : textLines(new DOMParser().parseFromString(j.data.html, 'text/html')).join('\n');
+    }, 60000);
+  }
+}
+function scriptJSON(html, re) { const m = re.exec(html); if (!m) return null; try { return JSON.parse(m[1]); } catch { try { return JSON.parse(new DOMParser().parseFromString(m[1], 'text/html').documentElement.textContent); } catch { return null; } } }
+function textLines(doc) {
+  doc.querySelectorAll('script,style,noscript,svg,head').forEach(e => e.remove());
+  const out = [], w = doc.createTreeWalker(doc.body || doc.documentElement, NodeFilter.SHOW_TEXT);
+  for (let n; (n = w.nextNode());) { const t = n.nodeValue.replace(/\s+/g, ' ').trim(); if (t) out.push(t); }
+  return out;
+}
+function find(o, pred, seen = new WeakSet()) { // depth-first search through parsed JSON
+  if (!o || typeof o !== 'object' || seen.has(o)) return null; seen.add(o);
+  if (pred(o)) return o;
+  for (const v of Object.values(o)) { const r = find(v, pred, seen); if (r) return r; }
+  return null;
+}
+const cleanVideoTitle = t => t.replace(/\s*[([][^)\]]*\b(official|lyrics?|audio|video|visuali[sz]er|hd|4k|hq|remaster(ed)?|music video|mv)\b[^)\]]*[)\]]/gi, '').replace(/\s*\|.*$/, '').trim();
+function domPairs(doc) { // rows with an element tagged "artist" next to one tagged "title"
+  const tag = el => [el.getAttribute('data-test'), el.getAttribute('data-testid'), typeof el.className === 'string' ? el.className : '', el.getAttribute('itemprop'), el.id].filter(Boolean).join(' ').toLowerCase();
+  const short = el => { const t = el.textContent.replace(/\s+/g, ' ').trim(); return t && t.length < 120 ? t : ''; };
+  const all = [...(doc.body || doc.documentElement).querySelectorAll('*')];
+  const arts = all.filter(el => /artist|byline|performer/.test(tag(el)) && !/album|image|img|avatar|cover/.test(tag(el)) && short(el) && ![...el.children].some(ch => /artist/.test(tag(ch))));
+  if (arts.length < 3) return [];
+  const rows = [];
+  for (const a of arts) {
+    let p = a.parentElement;
+    for (let d = 0; p && d < 6; d++, p = p.parentElement) {
+      const isTitle = el => el !== a && !el.contains(a) && !a.contains(el) && /title|track-?name|song|name/.test(tag(el)) && !/artist|album|playlist|header/.test(tag(el)) && short(el);
+      const t = [...p.querySelectorAll('*')].find(el => isTitle(el) && ![...el.querySelectorAll('*')].some(isTitle) && !arts.some(x => el.contains(x)));
+      if (t) { const r = trackRow(short(t), short(a)); if (r) rows.push([r, tag(a) + '|' + tag(t)]); break; }
+    }
+  }
+  // real track rows share one layout; keep only the most common artist/title pairing
+  const sig = new Map(); for (const [, k] of rows) sig.set(k, (sig.get(k) || 0) + 1);
+  const best = [...sig.entries()].sort((a, b) => b[1] - a[1])[0];
+  if (!best || best[1] < 3) return [];
+  const kept = rows.filter(r => r[1] === best[0]).map(r => r[0]);
+  const site = norm(((doc.querySelector('meta[property="og:site_name"]') || {}).content) || '');
+  const head = /^(title|titles|artist|artists|album|time|duration|date added|collection|profiles?|songs?|tracks?|#)$/i;
+  return kept.filter(r => !head.test(r[0].trim()) && !head.test(r[1].trim()) && (!site || norm(r[1]) !== site));
+}
+async function importLink(raw, onStatus) {
+  let url = raw.trim().replace(/^<|>$/g, '');
+  const sm = /spotify:(playlist|album|track|artist):([A-Za-z0-9]{22})/.exec(url);
+  if (sm) url = `https://open.spotify.com/${sm[1]}/${sm[2]}`;
+  if (!/^https?:\/\//i.test(url)) url = 'https://' + url;
+  let u; try { u = new URL(url); } catch { throw new Error('notlink'); }
+  const host = u.hostname.replace(/^www\.|^m\./, '');
+  if (/\s/.test(raw.trim()) || !host.includes('.')) throw new Error('notlink');
+  onStatus('Reading the playlist');
+  // short share links: follow them first
+  if (/^(deezer\.page\.link|link\.deezer\.com|spotify\.link|spotify\.app\.link|youtu\.be|on\.soundcloud\.com|tidal\.link|amzn\.to)$/.test(host) && !/^youtu\.be$/.test(host)) {
+    const md = await fetchPage(url, 'markdown');
+    const fin = (/^Final URL:\s*(\S+)/m.exec(md) || [])[1] || (/(https:\/\/(?:www\.)?(?:deezer\.com|open\.spotify\.com|soundcloud\.com|tidal\.com|music\.amazon)[^\s)"']+)/.exec(md) || [])[1];
+    if (fin && fin !== url) return importLink(fin, onStatus);
+  }
+  // Deezer: its own API
+  let m = /deezer\.com\/(?:[a-z]{2}(?:-[a-z]{2})?\/)?(playlist|album|artist)\/(\d+)/i.exec(url);
+  if (m) {
+    if (m[1] === 'artist') { const a = await dz(`artist/${m[2]}`); return { name: a.name, rows: [['', a.name]] }; }
+    return importDeezer(url);
+  }
+  // Spotify: the public embed page lists up to 100 songs
+  m = /open\.spotify\.com\/(?:intl-[a-z-]+\/)?(?:embed\/)?(playlist|album|track|artist)\/([A-Za-z0-9]{22})/.exec(url);
+  if (m) {
+    const html = await fetchPage(`https://open.spotify.com/embed/${m[1]}/${m[2]}`, 'html');
+    const nd = scriptJSON(html, /<script[^>]*id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/);
+    const ent = nd && find(nd, o => Array.isArray(o.trackList) || (o.type && o.uri && o.name));
+    const list = (nd && find(nd, o => Array.isArray(o.trackList)) || {}).trackList || [];
+    const rows = list.map(t => trackRow(t.title, t.subtitle)).filter(Boolean);
+    if (!rows.length && ent && m[1] === 'artist') rows.push(['', ent.name]);
+    if (rows.length) return { name: (ent && (ent.name || ent.title)) || 'Spotify playlist', rows };
+  }
+  // YouTube and YouTube Music playlists
+  const list = u.searchParams.get('list');
+  if (/(^|\.)youtube\.com$|^youtu\.be$/.test(host) && list) {
+    const md = await fetchPage(`https://www.youtube.com/playlist?list=${encodeURIComponent(list)}`, 'markdown');
+    const lines = md.split('\n'), rows = [];
+    for (let i = 0; i < lines.length; i++) {
+      const t = /^#{2,4}\s*\[(.+?)\]\(https:\/\/www\.youtube\.com\/watch\?v=[^)]*\)/.exec(lines[i]); if (!t) continue;
+      let ch = '';
+      for (let j = i + 1; j < Math.min(lines.length, i + 6); j++) { const c = /^\[([^\]]+)\]\(https:\/\/www\.youtube\.com\/(?:channel\/|@|c\/|user\/)/.exec(lines[j]); if (c) { ch = c[1]; break; } }
+      const title = cleanVideoTitle(t[1]);
+      const dash = /^(.+?)\s+[-–—]\s+(.+)$/.exec(title);
+      const r = dash ? trackRow(dash[2], dash[1]) : trackRow(title, ch.replace(/\s*-\s*topic$/i, '').replace(/vevo$/i, '').replace(/\s*official$/i, '').trim());
+      if (r) rows.push(r);
+    }
+    if (rows.length) return { name: ((/^Title:\s*(.+)$/m.exec(md) || [])[1] || 'YouTube playlist').replace(/\s*-\s*YouTube$/, ''), rows };
+    throw new Error('youtube');
+  }
+  // SoundCloud sets: each row is "N · [uploader](…) · [title](…)"; titles are often "Artist - Song"
+  if (/(^|\.)soundcloud\.com$/.test(host) && /\/sets\//.test(u.pathname)) {
+    const md = await fetchPage(url, 'markdown'), rows = [];
+    for (const l of md.split('\n')) {
+      const m2 = /^\*\s+\[\]\([^)]*\)\s+\d+\s+·\s+\[([^\]]+)\]\([^)]*\)\s+·\s+\[([^\]]+)\]/.exec(l); if (!m2) continue;
+      const title = cleanVideoTitle(m2[2]), dash = /^(.+?)\s+[-–—]\s+(.+)$/.exec(title);
+      const r = dash ? trackRow(dash[2], dash[1]) : trackRow(title, m2[1]); if (r) rows.push(r);
+    }
+    if (rows.length) return { name: (/^Title:\s*(.+)$/m.exec(md) || [])[1] || 'SoundCloud playlist', rows };
+  }
+  // everything else: structured data in the page, then row layout, then plain text checked against Deezer
+  const html = await fetchPage(url, 'html');
+  const doc = new DOMParser().parseFromString(html, 'text/html');
+  const name = (doc.querySelector('meta[property="og:title"]')?.content || doc.title || 'Imported playlist').replace(/\s*[|·–-]\s*(Apple Music|TIDAL|SoundCloud|Amazon Music|Last\.fm|Bandcamp|Qobuz).*$/i, '').trim();
+  let rows = [];
+  const ad = scriptJSON(html, /<script[^>]*id="serialized-server-data"[^>]*>([\s\S]*?)<\/script>/); // Apple Music
+  if (ad) rows = parseJSONObj(ad).filter(r => r[0]);
+  if (rows.length < 3) for (const sc of doc.querySelectorAll('script[type="application/ld+json"],script[type="application/json"],script#__NEXT_DATA__')) {
+    try { rows.push(...parseJSONObj(JSON.parse(sc.textContent)).filter(r => r[0])); } catch { }
+  }
+  if (rows.length < 3) { const host1 = host.split('.')[0]; rows = domPairs(doc).filter(r => norm(r[1]) !== host1); }
+  if (rows.length < 3) {
+    const lines = pageLines(textLines(doc).join('\n')).slice(0, 160);
+    const found = await matchLines(lines, (i, n, f) => onStatus(`Matching songs: ${plural(f, 'song')} found`, n ? i / n : 1));
+    rows = found.map(t => [t.t, t.a]);
+  }
+  const seen = new Set(); rows = rows.filter(r => { const k = norm(r[0]) + '|' + norm(r[1]); if (seen.has(k)) return false; seen.add(k); return true; });
+  if (!rows.length) throw new Error('nothing');
+  return { name, rows };
 }
 function addCrate(name, rows, src) {
   rows = rows.filter(r => r && r[1]);
@@ -913,36 +1099,16 @@ function tasteChanged() {
   ensureAhead(); renderStart();
 }
 
-/* ================= import: screenshots, read on this device ================= */
-let tessP = null;
-function loadTesseract() {
-  if (window.Tesseract) return Promise.resolve();
-  return tessP ||= new Promise((res, rej) => {
-    const s = document.createElement('script'); s.src = 'https://cdn.jsdelivr.net/npm/tesseract.js@6.0.1/dist/tesseract.min.js';
-    s.onload = res; s.onerror = () => { tessP = null; s.remove(); rej(new Error('ocr')); }; document.head.appendChild(s);
-  });
-}
-async function prepImage(file) {
-  const bmp = await createImageBitmap(file);
-  const scale = clamp(1400 / bmp.width, 1, 2.5), w = Math.round(bmp.width * scale), h = Math.round(bmp.height * scale);
-  const c = document.createElement('canvas'); c.width = w; c.height = h;
-  const g = c.getContext('2d', { willReadFrequently: true }); g.drawImage(bmp, 0, 0, w, h); if (bmp.close) bmp.close();
-  const im = g.getImageData(0, 0, w, h), d = im.data; let sum = 0;
-  for (let i = 0; i < d.length; i += 4) { const y = .299 * d[i] + .587 * d[i + 1] + .114 * d[i + 2]; d[i] = y; sum += y; }
-  const inv = sum / (d.length / 4) < 128; // dark mode screenshots read better inverted
-  for (let i = 0; i < d.length; i += 4) { let y = d[i]; if (inv) y = 255 - y; y = clamp((y - 128) * 1.5 + 128, 0, 255); d[i] = d[i + 1] = d[i + 2] = y; }
-  g.putImageData(im, 0, 0);
-  return c;
-}
-const OCR_NOISE = /^(shuffle|play|playing|liked songs|add to playlist|add songs|download(ed)?|search|home|library|your library|premium|sort|filter|edit|share|songs?|albums?|artists?|playlists?|recommended|explore|following|follow|more|now playing|up next|queue|lyrics|related|for you|radio|browse|listen now|e)$/i;
-function cleanOCR(l) {
+/* page text matched against Deezer: last resort for sites without structured data */
+const LINE_NOISE = /^(shuffle|play|playing|liked songs|add to playlist|add songs|download(ed)?|search|home|library|your library|premium|sort|filter|edit|share|songs?|albums?|artists?|playlists?|recommended|explore|following|follow|more|now playing|up next|queue|lyrics|related|for you|radio|browse|listen now|e)$/i;
+function cleanLine(l) {
   return l.replace(/[|¦©®™“”"«»]/g, ' ').replace(/^[^\p{L}\p{N}(]+/u, '').replace(/^E\s+(?=\p{L})/u, '').replace(/\s+\d{1,2}:\d{2}\b.*$/, '')
     .replace(/\s+[^\p{L}\p{N})\]!?]+$/u, '').replace(/\s{2,}/g, ' ').trim();
 }
-function ocrLines(text) {
-  return text.split('\n').map(cleanOCR).filter(l => l.length >= 2 && /\p{L}/u.test(l) && !OCR_NOISE.test(l) && !/^\d+ (songs?|titles?|tracks?)/i.test(l) && (l.match(/\p{L}/gu) || []).length / l.length > .45);
+function pageLines(text) {
+  return text.split('\n').map(cleanLine).filter(l => l.length >= 2 && /\p{L}/u.test(l) && !LINE_NOISE.test(l) && !/^\d+ (songs?|titles?|tracks?)/i.test(l) && (l.match(/\p{L}/gu) || []).length / l.length > .45);
 }
-async function matchOCR(lines, onStep) {
+async function matchLines(lines, onStep) {
   const out = [], seen = new Set();
   const accept = (r, t, a) => r && titleSim(t, r.t) >= .62 && (dice(norm(a), norm(r.a)) >= .55 || (norm(r.a).length > 2 && norm(a).includes(norm(r.a))));
   const push = r => { if (!seen.has(r.id)) { seen.add(r.id); out.push(r); } };
@@ -966,38 +1132,67 @@ async function matchOCR(lines, onStep) {
   return out;
 }
 
+/* ================= link box (start screen and Library) ================= */
+const LINK_HELP = 'Works with Spotify, Apple Music, YouTube, YouTube Music, Deezer, Tidal, SoundCloud and most other sites. The playlist must be public.';
+function wireLink(input, btn, out, done) {
+  let busy = false;
+  const go = async () => {
+    const v = input.value.trim(); if (!v || busy) return;
+    busy = true; btn.disabled = true; input.disabled = true;
+    const set = (msg, frac) => { out.innerHTML = `<div class="progress">${esc(msg)}<div class="bar"><i style="width:${Math.round((frac ?? .3) * 100)}%"></i></div></div>`; };
+    try {
+      const { name, rows } = await importLink(v, set);
+      out.innerHTML = '';
+      if (addCrate(name, rows, 'link')) { input.value = ''; done && done(); }
+    } catch (e) {
+      const msg = e.message === 'notlink' ? 'That doesn’t look like a link. Copy the playlist’s share link and paste it here.'
+        : e.message === 'youtube' ? 'That YouTube playlist couldn’t be read. Auto-generated mixes and private playlists can’t be opened; try a regular public playlist.'
+        : e.message === 'nothing' ? 'No songs found on that page. Make sure the playlist is public, or try the Files and other ways options.'
+        : 'That link couldn’t be opened right now. Check your connection and try again in a minute.';
+      out.innerHTML = `<div class="guide">${msg}</div>`;
+    } finally { busy = false; btn.disabled = false; input.disabled = false; }
+  };
+  btn.onclick = go; input.onkeydown = e => { if (e.key === 'Enter') go(); };
+}
+
 /* ================= start screen ================= */
 const startEl = $('#start');
 function renderStart() {
   if (started) { startEl.hidden = true; return; }
   startEl.hidden = false;
   if (hasTaste()) {
-    const names = seedList().slice(0, 3).map(s => s.name);
+    const own = [...tasteMap().values()].sort((a, b) => b.w - a.w), names = own.slice(0, 3).map(s => s.name);
     startEl.classList.add('over');
     startEl.innerHTML = `<div class="sbox">
       <h1>New music, one song at a time.</h1>
-      <p>Picked from artists near ${esc(names.join(', '))}${seedList().length > 3 ? ' and the rest of your music' : ''}. Scroll for the next song and like the ones you love.</p>
+      <p>Picked from artists near ${esc(names.join(', '))}${own.length > 3 ? ' and the rest of your music' : ''}. Scroll for the next song and like the ones you love.</p>
       <div class="go row"><button class="bigplay" id="go">${I.play}Start listening</button><button class="pill" id="golib">Library</button></div></div>`;
     $('#go').onclick = start;
     $('#golib').onclick = () => openSheet();
   } else {
     startEl.classList.remove('over');
     startEl.innerHTML = `<div class="sbox">
-      <h1>Endless new music from the music you already love.</h1>
-      <p>Bring a playlist from any app. Sidetrack plays you artists that sit next to yours, one full-screen song at a time, and learns from what you like.</p>
-      <div class="choices">
-        <button class="choice main" data-open="shots">${I.shot}<b>Screenshots of a playlist</b><small>Works with Spotify, Apple Music, YouTube Music and any other app</small></button>
-        <button class="choice" data-open="file">${I.file}<b>A playlist link or file</b><small>Deezer links, Exportify CSV, M3U, pasted lists</small></button>
+      <h1>Endless new music, one song at a time.</h1>
+      <p>Scroll for the next song, like the ones you love. Sidetrack learns from every like and skip.</p>
+      <div class="go"><button class="bigplay" id="go">${I.play}Start listening</button></div>
+      <p class="sub">Starts with what’s popular right now. Add a playlist to start from your own taste instead:</p>
+      <div class="row nw linkrow"><input type="url" id="oblink" placeholder="Paste a playlist link" aria-label="Playlist link"><button class="pill solid" id="oblinkgo">Add</button></div>
+      <div id="oblinkout"></div>
+      <p class="fine">${LINK_HELP}</p>
+      <div class="row more"><button class="textbtn" data-open="more">Files and other ways</button><button class="textbtn" id="obartists">Name some artists</button></div>
+      <div id="obpick" hidden>
+        <div class="sugg"><input type="search" id="obq" placeholder="Start typing an artist" autocomplete="off" aria-label="Search for an artist"><ul id="obs" hidden></ul></div>
+        <div class="chips" id="obchips"></div>
+        <button class="pill solid" id="obgo" hidden>Add artists</button>
       </div>
-      <p style="font-size:15px;margin-top:22px">Or name a few artists</p>
-      <div class="sugg" style="margin-top:8px"><input type="search" id="obq" placeholder="Start typing an artist" autocomplete="off" aria-label="Search for an artist"><ul id="obs" hidden></ul></div>
-      <div class="chips" id="obchips"></div>
-      <button class="bigplay" id="obgo" hidden>${I.play}Start listening</button>
     </div>`;
+    $('#go').onclick = start;
+    wireLink($('#oblink'), $('#oblinkgo'), $('#oblinkout'));
     $$('[data-open]', startEl).forEach(b => b.onclick = () => openSheet(b.dataset.open));
+    $('#obartists').onclick = () => { $('#obpick').hidden = false; $('#obq').focus(); };
     wireArtistPicker($('#obq'), $('#obs'), $('#obchips'), picked => {
-      const go = $('#obgo'); go.hidden = !picked.size;
-      go.onclick = () => { if (addCrate('Artists I picked', [...picked.values()].map(a => ['', a.name]), 'picked')) start(); };
+      const go = $('#obgo'); go.hidden = !picked.size; go.textContent = `Add ${plural(picked.size, 'artist')}`;
+      go.onclick = () => addCrate('Artists I picked', [...picked.values()].map(a => ['', a.name]), 'picked');
     });
   }
 }
@@ -1016,7 +1211,7 @@ function wireArtistPicker(q, list, chips, onChange) {
   chips.onclick = e => { const b = e.target.closest('[data-rm]'); if (b) { picked.delete(+b.dataset.rm); draw(); } };
 }
 function start() {
-  if (!hasTaste() || started) return;
+  if (started) return;
   unlockAudio(); // must happen inside the tap
   started = true; startEl.hidden = true;
   if (cur >= 0 && cur < SL.length) { playSlide(SL[cur]); ensureAhead(); }
@@ -1040,17 +1235,13 @@ function renderSheet() {
   $('#sheetBody').innerHTML = `
     <div class="shead"><h2>Library</h2><button class="x" data-x aria-label="Close">${I.x}</button></div>
     <div class="sec">
-      <h3>Add music</h3><p>Your playlists are the starting point. Sidetrack never plays you artists you already have.</p>
+      <h3>Add music</h3><p>Your playlists steer the feed. Sidetrack never plays you artists you already have. Links are read through the free page reader r.jina.ai.</p>
       <div class="imp">
-        <div class="opt" data-sec="shots"><b>Screenshots of a playlist</b>
-          <small>Scroll through a playlist in any app and take screenshots. The text is read on this device. The first time, the reader downloads once (about 6 MB).</small>
-          <button class="btn primary" id="shotbtn">Choose screenshots</button><input type="file" id="shotin" accept="image/*" multiple hidden>
-          <div id="shotout"></div></div>
         <div class="opt" data-sec="file"><b>Playlist link</b>
-          <small>Deezer playlists and albums import directly. Paste a link from another app to see how to bring it over.</small>
-          <div class="row nw"><input type="url" id="link" placeholder="Paste a playlist link" aria-label="Playlist link"><button class="btn primary" id="linkgo">Import</button></div>
+          <small>${LINK_HELP}</small>
+          <div class="row nw"><input type="url" id="link" placeholder="Paste a playlist link" aria-label="Playlist link"><button class="btn primary" id="linkgo">Add</button></div>
           <div id="linkout"></div></div>
-        <div class="opt"><b>Playlist file</b>
+        <div class="opt" data-sec="more"><b>Playlist file</b>
           <small>Exportify CSV, Spotify data export (JSON), M3U, XSPF, JSPF or TXT</small>
           <div class="drop" id="drop" tabindex="0" role="button">Drop files here or click to choose</div><input type="file" id="filein" multiple accept=".csv,.tsv,.m3u,.m3u8,.xspf,.jspf,.json,.txt" hidden></div>
         <div class="opt"><b>Paste a list</b>
@@ -1088,27 +1279,7 @@ function renderSheet() {
 function wireSheet() {
   const b = $('#sheetBody');
   $('[data-x]', b).onclick = () => sheet.close();
-  $('#shotbtn').onclick = () => $('#shotin').click();
-  $('#shotin').onchange = e => runOCR([...e.target.files]);
-  const linkgo = async () => {
-    const v = $('#link').value.trim(), out = $('#linkout'); if (!v) return;
-    const k = linkKind(v); out.innerHTML = '';
-    if (k === 'deezer') {
-      const btn = $('#linkgo'); btn.disabled = true; btn.textContent = 'Importing';
-      try { const { name, rows } = await importDeezer(v); if (addCrate(name, rows, 'deezer')) { renderSheet(); return; } }
-      catch (e) { out.innerHTML = `<div class="guide">${e.message === 'link' ? 'That Deezer link does not point to a playlist or album.' : 'Could not read that playlist. Make sure it is public.'}</div>`; }
-      btn.disabled = false; btn.textContent = 'Import'; return;
-    }
-    const guides = {
-      'deezer-short': `Short Deezer links can't be opened from here. Open the link, copy the full address (it looks like deezer.com/playlist/123…) and paste that.`,
-      spotify: `Spotify only shares playlists with apps you sign in to, so Sidetrack can't read this link. Two ways that work:<ol><li><b>Screenshots</b>: open the playlist on your phone, screenshot it while scrolling, and add the screenshots above.</li><li><b>Exportify</b>: open <a href="https://exportify.app" target="_blank" rel="noopener">exportify.app</a>, sign in with Spotify, click Export next to the playlist, then drop the CSV in Playlist file below.</li></ol>`,
-      apple: `Apple Music doesn't let other sites read playlists. Two ways that work:<ol><li><b>Screenshots</b> of the playlist, added above.</li><li>On a computer: open the playlist in Apple Music or iTunes, select all songs, copy, and paste into Paste a list below.</li></ol>`,
-      youtube: `YouTube doesn't let other sites read playlists. Take <b>screenshots</b> of the playlist in YouTube Music and add them above.`,
-      other: `That service doesn't let other sites read playlists. Take <b>screenshots</b> of the playlist and add them above.`,
-    };
-    out.innerHTML = `<div class="guide">${guides[k] || 'That does not look like a playlist link.'}</div>`;
-  };
-  $('#linkgo').onclick = linkgo; $('#link').onkeydown = e => { if (e.key === 'Enter') linkgo(); };
+  wireLink($('#link'), $('#linkgo'), $('#linkout'), () => renderSheet());
   const drop = $('#drop'), fin = $('#filein');
   const readFiles = async fs => {
     let any = false;
@@ -1122,7 +1293,7 @@ function wireSheet() {
   drop.ondrop = e => { e.preventDefault(); drop.classList.remove('over'); readFiles([...e.dataTransfer.files]); };
   $('#pastego').onclick = () => {
     const v = $('#paste').value, rows = parseAny(v);
-    if (!rows.length && /open\.spotify\.com\/track\//.test(v)) { toast('Spotify copies song links, not names. Use screenshots or Exportify instead.'); return; }
+    if (!rows.length && /open\.spotify\.com\/track\//.test(v)) { toast('Spotify copies song links, not names. Paste the playlist’s link in Playlist link instead.'); return; }
     if (addCrate('Pasted list', rows, 'paste')) renderSheet();
   };
   wireArtistPicker($('#lq'), $('#ls'), $('#lchips'), picked => {
@@ -1161,39 +1332,6 @@ function wireSheet() {
     } catch { toast('That file is not a Sidetrack backup.'); }
   };
 }
-async function runOCR(files) {
-  if (!files.length) return;
-  const out = $('#shotout'), btn = $('#shotbtn');
-  btn.disabled = true;
-  const set = (msg, frac) => { out.innerHTML = `<div class="progress">${esc(msg)}<div class="bar"><i style="width:${Math.round(frac * 100)}%"></i></div></div>`; };
-  let worker = null;
-  try {
-    set('Loading the text reader', .02);
-    await loadTesseract();
-    worker = await Tesseract.createWorker('eng');
-    const lines = [];
-    for (let i = 0; i < files.length; i++) {
-      set(`Reading screenshot ${i + 1} of ${files.length}`, .05 + .45 * i / files.length);
-      const { data } = await worker.recognize(await prepImage(files[i]));
-      for (const l of ocrLines(data.text || '')) if (lines[lines.length - 1] !== l) lines.push(l);
-    }
-    await worker.terminate(); worker = null;
-    const found = await matchOCR(lines.slice(0, 400), (i, n, f) => set(`Matching songs: ${plural(f, 'song')} found`, .5 + .5 * (n ? i / n : 1)));
-    if (!found.length) { out.innerHTML = '<div class="guide">No songs recognized. Use screenshots where song titles and artists are visible as text, and don’t crop them.</div>'; return; }
-    out.innerHTML = `<p class="small" style="margin:12px 0 0"><b>${plural(found.length, 'song')} found.</b> Uncheck any that are wrong.</p>
-      <div class="found">${found.map((t, i) => `<label><input type="checkbox" checked data-f="${i}"><span>${esc(t.t)}<small>${esc(t.a)}</small></span></label>`).join('')}</div>
-      <div class="row nw"><input type="text" id="shotname" placeholder="Name this playlist" aria-label="Playlist name"><button class="btn primary" id="shotadd">Add songs</button></div>`;
-    $('#shotadd').onclick = () => {
-      const rows = $$('[data-f]', out).filter(c => c.checked).map(c => found[+c.dataset.f]).map(t => [t.t, t.a]);
-      if (addCrate($('#shotname').value.trim() || 'From screenshots', rows, 'shots')) renderSheet();
-    };
-  } catch (e) {
-    out.innerHTML = `<div class="guide">${e.message === 'ocr' ? 'The text reader did not download. Check your connection and try again.' : 'Something went wrong reading those screenshots. Try fewer at a time.'}</div>`;
-  } finally {
-    if (worker) worker.terminate().catch(() => { });
-    btn.disabled = false; const inp = $('#shotin'); if (inp) inp.value = '';
-  }
-}
 function playNow(l) {
   sheet.close();
   const item = { tr: { id: l.id, t: l.t, a: l.a, ai: l.ai, al: l.al, c: l.c }, via: null, label: 'From your likes', g: 0 };
@@ -1206,4 +1344,4 @@ function playNow(l) {
 /* ================= boot ================= */
 renderStart();
 updateLoader();
-if (hasTaste()) fill();
+fill();
